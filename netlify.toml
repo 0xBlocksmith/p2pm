@@ -1,9 +1,9 @@
-# Next.js app in the frontend/ subfolder (monorepo). No `base` — that makes the
-# publish default to the base dir and collide with the Next.js plugin. Build from
-# the repo root into frontend/, and publish frontend/.next (≠ base = repo root).
+# Next.js app in the frontend/ subfolder. The Netlify "Base directory" is set to
+# `frontend`, so the build already runs inside frontend/ — commands and the
+# publish path here are RELATIVE to that base. publish = .next (≠ base).
 [build]
-  command = "npm --prefix frontend install && npm --prefix frontend run build"
-  publish = "frontend/.next"
+  command = "npm install && npm run build"
+  publish = ".next"
 
 [[plugins]]
   package = "@netlify/plugin-nextjs"

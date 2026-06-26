@@ -56,6 +56,8 @@ contract MockDiamond {
         SellStatus status;
         string encUpi; // user's UPI encrypted to merchant
         string merchantPubkey;
+        uint8 disputeRaisedBy; // test-only: mirror Diamond's Dispute.raisedBy
+        uint8 disputeStatus;   // test-only: mirror Diamond's Dispute.status
     }
 
     mapping(address => bool) public activeIntegrators;
@@ -150,7 +152,9 @@ contract MockDiamond {
             currency: currency,
             status: SellStatus.PLACED,
             encUpi: "",
-            merchantPubkey: ""
+            merchantPubkey: "",
+            disputeRaisedBy: 0,
+            disputeStatus: 0
         });
         emit MockSellOrderPlaced(orderId, user, amount, currency);
     }
@@ -269,7 +273,9 @@ contract MockDiamond {
             currency: currency,
             status: SellStatus.PLACED,
             encUpi: "",
-            merchantPubkey: ""
+            merchantPubkey: "",
+            disputeRaisedBy: 0,
+            disputeStatus: 0
         });
         emit MockSellOrderPlaced(orderId, msg.sender, amount, currency);
     }
@@ -359,6 +365,14 @@ contract MockDiamond {
 
     function setSellFee(uint256 fee) external {
         sellFee = fee;
+    }
+
+    /// @notice Test-only: stamp a dispute onto a SELL order so the integrator's
+    ///         reconcile dispute guard (and the disputed-clawback recovery path)
+    ///         can be exercised. Real Diamond sets these during dispute flow.
+    function setSellDispute(uint256 orderId, uint8 raisedBy, uint8 status) external {
+        sellOrders[orderId].disputeRaisedBy = raisedBy;
+        sellOrders[orderId].disputeStatus = status;
     }
 
     function getAdditionalOrderDetails(
@@ -456,7 +470,8 @@ contract MockDiamond {
         o.user = s.user;
         o.currency = s.currency;
         o.id = orderId;
-        // Strings / arrays / dispute default-init to empty — fine for the
-        // status-only consumer.
+        o.disputeInfo.raisedBy = s.disputeRaisedBy;
+        o.disputeInfo.status = s.disputeStatus;
+        // Remaining strings / arrays default-init to empty.
     }
 }

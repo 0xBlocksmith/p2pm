@@ -12,27 +12,28 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 
 /**
  * @title MerchantTerminalIntegrator
- * @notice P2P merchant terminal: merchants accept INR (UPI) payments from
- *         customers and receive USDC on Base under a 30-day settlement lock,
- *         then withdraw either as INR to their saved UPI (SELL offramp via
- *         the system proxy, TradeStars/Marketplace pattern) or as USDC to
- *         their wallet.
+ * @notice P2P merchant terminal: merchants accept local-currency payments from
+ *         customers and receive USDC on Base under a settlement lock, then
+ *         withdraw either as local fiat to their saved payout id (SELL offramp
+ *         via the merchant proxy, TradeStars/Marketplace pattern) or as USDC to
+ *         their wallet. The offramp currency is chosen per merchant at
+ *         registration, so any country (INR/UPI, BRL/PIX, ARS, …) is supported
+ *         — adding a new one needs only a funded circle, no contract change.
  *
  *         BUY flow: the merchant places the order (msg.sender), the order is
  *         routed through the merchant's UserProxy clone (B2BGatewayFacet is
  *         proxy-only), recipientAddr = the merchant's proxy and the
  *         integrator registers with usdcThroughIntegrator = false — the
  *         Diamond sends USDC to the proxy at completion and onOrderComplete
- *         pulls it into this contract, where it sits in 30-day settlement
- *         buckets.
+ *         pulls it into this contract, where it sits in settlement buckets
+ *         (SETTLEMENT_PERIOD).
  *
- *         SELL flow (INR withdrawal): a system proxy keyed on address(this)
- *         places the sell order (order.user = system proxy); this contract
- *         funds that proxy with the USDC at placement and passes the
- *         merchant's saved upiId as userPubKey. If a sell order is cancelled
- *         on the Diamond, the USDC is refunded to the system proxy;
- *         `reconcileWithdrawal` sweeps it back and re-credits the merchant so
- *         no funds are stranded.
+ *         SELL flow (fiat withdrawal): the merchant's own proxy places the sell
+ *         order; this contract funds that proxy with the USDC at placement and
+ *         passes the merchant's saved payout id as userPubKey, in the merchant's
+ *         own currency. If a sell order is cancelled on the Diamond, the USDC is
+ *         refunded to the proxy; `reconcileWithdrawal` sweeps it back and
+ *         re-credits the merchant so no funds are stranded.
  *
  *         Limits enforced in validateOrder: 50 USDC per transaction and 4
  *         transactions per merchant per UTC day. The system proxy is carved
@@ -66,11 +67,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     error OfframpFeeNotReady();
     error OfframpInsufficientPool();
     error WithdrawalNotFound();
+    error InvalidCurrency();
+    error WithdrawalInFlight();
+    error FiatAlreadyDelivered();
 
     // ─── Events ───────────────────────────────────────────────────────
     event OrderPlaced(uint256 indexed orderId, address indexed user, uint256 amount);
     event UserProxyDeployed(address indexed user, address proxy);
-    event MerchantRegistered(address indexed merchant, string upiId, string shopName);
+    event MerchantRegistered(address indexed merchant, string payoutId, string shopName, bytes32 currency);
     event OrderCompleted(
         uint256 indexed orderId,
         address indexed merchant,
@@ -78,7 +82,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         uint256 unlockTimestamp
     );
     event OrderCancelled(uint256 indexed orderId, address indexed merchant);
-    event WithdrawalINR(address indexed merchant, uint256 indexed orderId, uint256 amount);
+    event WithdrawalFiat(address indexed merchant, uint256 indexed orderId, bytes32 currency, uint256 amount);
     event WithdrawalUpiDelivered(uint256 indexed orderId, uint256 actualUsdtAmount);
     event WithdrawalUSDC(address indexed merchant, uint256 amount);
     event WithdrawalReconciled(address indexed merchant, uint256 indexed orderId, uint256 amount);
@@ -121,12 +125,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     struct Merchant {
         address merchantAddr;
-        string upiId;
+        string payoutId;     // generic payout handle: UPI / PIX key / CBU / alias
         string shopName;
+        bytes32 currency;    // offramp currency, e.g. bytes32("INR"|"BRL"|"ARS") — set once at registration
         uint256 totalDeposited;
         bool isFrozen;
         uint256 dailyTxCount;
         uint256 lastTxDate;
+        uint256 inFlightWithdrawals; // count of this merchant's unsettled SELL withdrawals
         SettlementBucket[] buckets;
     }
 
@@ -136,14 +142,26 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///      bucket. `settled` is a replay guard.
     struct PendingWithdrawal {
         address merchant;
-        uint256 amount;
+        uint256 amount;     // principal escrowed for THIS order (excludes fee)
         bool settled;
         bool upiDelivered; // setSellOrderUpi (fund+approve) has run for this SELL
+        uint256 feeAdvanced; // fee topped up from the pool for THIS order (for exact recovery)
     }
+
+    /// @notice Running sum of every merchant's bucket balance. The contract's
+    ///         hard solvency invariant is `usdc.balanceOf(this) >= totalOwed`
+    ///         at all times: protocol fees are charged to the withdrawing
+    ///         merchant, never sourced from the commingled pool, so the pool
+    ///         can never go under-collateralized against what merchants are owed.
+    uint256 public totalOwed;
 
     mapping(address => Merchant) public merchants;
     mapping(address => bool) public registered;
     mapping(uint256 => address) public orderToMerchant;
+    /// @notice BUY order id => the UTC day it was placed, so onOrderCancel only
+    ///         releases a daily-count slot for the CURRENT day (a stale cross-day
+    ///         cancel must not decrement a freshly-rolled counter).
+    mapping(uint256 => uint256) public orderPlacementDay;
     mapping(uint256 => PendingWithdrawal) public withdrawals;
     /// @notice proxy address => the EOA it was deployed for. Set in
     ///         _ensureProxy. Lets validateOrder recognize a SELL placed by one
@@ -186,16 +204,88 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         proxyImpl = address(new UserProxy());
     }
 
+    // ─── Currency naming (string ⇄ bytes32) ──────────────────────────
+    //
+    // The offramp currency is stored as a `bytes32` because that's what the p2p
+    // Diamond expects on every order. But a bytes32 like
+    // 0x494e520000…00 is unreadable, so this contract speaks plain ISO-4217
+    // currency CODES ("INR", "BRL", "ARS", "MXN", "NGN", …):
+    //
+    //   • `registerMerchant(payoutId, shopName, "BRL")`  ← human-readable string
+    //   • `getMerchantCurrency(addr)` → "BRL"            ← read it back as text
+    //
+    // Any country is supported as long as the p2p protocol has a circle for that
+    // currency code — adding one needs NO contract change.
+
+    /// @notice Pack a currency code string ("INR") into the bytes32 the Diamond
+    ///         uses. Reverts on empty / >31 chars. Pure, so anyone can preview it.
+    function toCurrency(string memory code) public pure returns (bytes32 out) {
+        bytes memory b = bytes(code);
+        if (b.length == 0 || b.length > 31) revert InvalidCurrency();
+        // Reject interior NUL bytes so the value always round-trips through
+        // fromCurrency (which truncates at the first NUL). Otherwise "IN\0R"
+        // would store distinctly yet display as "IN", and two merchants could
+        // register codes that render identically but route to different circles.
+        for (uint256 i = 0; i < b.length; i++) {
+            if (b[i] == 0) revert InvalidCurrency();
+        }
+        assembly { out := mload(add(b, 32)) }
+    }
+
+    /// @notice Unpack a bytes32 currency back to its readable code string.
+    function fromCurrency(bytes32 cur) public pure returns (string memory) {
+        uint256 len = 0;
+        while (len < 32 && cur[len] != 0) { len++; }
+        bytes memory out = new bytes(len);
+        for (uint256 i = 0; i < len; i++) { out[i] = cur[i]; }
+        return string(out);
+    }
+
     // ─── Merchant registration ────────────────────────────────────────
 
-    function registerMerchant(string calldata upiId, string calldata shopName) external {
+    /// @notice Register the calling merchant with a human-readable currency
+    ///         CODE ("INR", "BRL", "ARS", …). This is the recommended entry
+    ///         point — any country picks its ISO currency code and is supported
+    ///         as long as the protocol has a circle for it. The payout id is a
+    ///         generic string (UPI / PIX key / CBU / alias) — the contract never
+    ///         interprets it; the country's LP knows how to pay it out.
+    /// @param payoutId  Where local-fiat withdrawals land (UPI/PIX/CBU/…).
+    /// @param shopName  Display name.
+    /// @param currencyCode ISO-4217-style code, e.g. "INR", "BRL". Non-empty.
+    function registerMerchant(
+        string calldata payoutId,
+        string calldata shopName,
+        string calldata currencyCode
+    ) external {
+        _register(payoutId, shopName, toCurrency(currencyCode));
+    }
+
+    /// @notice Same as above but takes the packed bytes32 directly, for callers
+    ///         that already have it (e.g. tooling). Most integrations should use
+    ///         the string overload above.
+    /// @param currency bytes32 offramp currency, e.g. bytes32("INR"). Non-zero.
+    function registerMerchantRaw(
+        string calldata payoutId,
+        string calldata shopName,
+        bytes32 currency
+    ) external {
+        _register(payoutId, shopName, currency);
+    }
+
+    function _register(
+        string calldata payoutId,
+        string calldata shopName,
+        bytes32 currency
+    ) internal {
         if (registered[msg.sender]) revert AlreadyRegistered();
+        if (currency == bytes32(0)) revert InvalidCurrency();
         Merchant storage m = merchants[msg.sender];
         m.merchantAddr = msg.sender;
-        m.upiId = upiId;
+        m.payoutId = payoutId;
         m.shopName = shopName;
+        m.currency = currency;
         registered[msg.sender] = true;
-        emit MerchantRegistered(msg.sender, upiId, shopName);
+        emit MerchantRegistered(msg.sender, payoutId, shopName, currency);
     }
 
     // ─── IP2PIntegrator ───────────────────────────────────────────────
@@ -253,10 +343,16 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         address merchant = orderToMerchant[orderId];
         if (merchant == address(0)) return; // SELL or unknown — nothing to release
         Merchant storage m = merchants[merchant];
-        if (m.dailyTxCount > 0) {
+        // MED-4: only release a slot for the CURRENT day. A day-N order cancelled
+        // on day N+1 must NOT decrement N+1's freshly-rolled counter (that slot
+        // was never consumed today). If the day already rolled, today's count is
+        // effectively 0 for the stale order, so we skip the decrement.
+        uint256 placedDay = orderPlacementDay[orderId];
+        if (m.lastTxDate == placedDay && m.dailyTxCount > 0) {
             m.dailyTxCount--;
         }
         delete orderToMerchant[orderId];
+        delete orderPlacementDay[orderId];
         emit OrderCancelled(orderId, merchant);
     }
 
@@ -288,89 +384,129 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
         // validateOrder receives no orderId (the Diamond assigns it after
         // validation) — record the merchant here so onOrderCancel can
-        // release the daily-count slot.
+        // release the daily-count slot. Record the placement day too so a
+        // stale cross-day cancellation can't decrement a different day's count.
         orderToMerchant[orderId] = msg.sender;
+        orderPlacementDay[orderId] = block.timestamp / 86400;
 
         emit OrderPlaced(orderId, msg.sender, total);
     }
 
     // ─── Withdrawals ──────────────────────────────────────────────────
 
-    /// @notice Withdraw unlocked USDC as INR to the merchant's saved UPI.
-    ///         Places a SELL order through the MERCHANT'S OWN proxy (order.user
-    ///         = merchant proxy) funded at placement; the Diamond pulls the
-    ///         USDC from the proxy during settlement. Each merchant uses their
-    ///         own proxy so in-flight withdrawal funds are physically isolated
-    ///         per merchant — a cancellation of one merchant's order can never
-    ///         touch another merchant's parked funds. The withdrawal is tracked
-    ///         so a Diamond-side cancellation can be reconciled (funds returned).
-    /// @param circleId The INR circle on the Diamond, resolved off-chain via the
-    ///        subgraph (exactly as userPlaceOrder does for BUY orders). The
-    ///        currency is pinned to bytes32("INR") in-contract, so the caller can
-    ///        only influence WHICH INR circle is used, never the offramp currency.
-    ///        The Diamond rejects circleId 0 and reverts on an (INR, non-INR
-    ///        circle) mismatch, so a wrong id can only make THIS merchant's own
-    ///        withdrawal revert — never lose or misroute another merchant's funds.
-    /// @param upiOverride If non-empty, INR is paid to THIS UPI for this
-    ///        withdrawal instead of the saved one (so a merchant can send to a
-    ///        different account without changing their default). Empty string =
-    ///        use the saved UPI from registration. The saved UPI is left
-    ///        unchanged either way.
-    function withdrawINR(uint256 amount, uint256 circleId, string calldata upiOverride)
+    /// @notice Withdraw unlocked USDC as local fiat to the merchant's saved
+    ///         payout handle, in the merchant's OWN currency (chosen at
+    ///         registration). Places a SELL order through the merchant's own
+    ///         proxy, funded at placement. Per-merchant proxies keep in-flight
+    ///         withdrawal funds physically isolated, so one merchant's
+    ///         cancellation can never touch another's parked funds.
+    /// @param circleId The offramp circle on the Diamond for this currency,
+    ///        resolved off-chain via the subgraph. The currency itself comes
+    ///        from the merchant's on-chain profile (set at registration), so the
+    ///        caller can only influence WHICH circle is used, never the currency.
+    /// @param payoutOverride If non-empty, fiat is paid to THIS handle for this
+    ///        withdrawal instead of the saved one. Empty = use the saved payout id.
+    function withdrawFiat(uint256 amount, uint256 circleId, string calldata payoutOverride)
         external
         nonReentrant
         returns (uint256 orderId)
     {
-        if (circleId == 0) revert InvalidCircle(); // friendly local guard
         Merchant storage m = _checkWithdraw(amount);
-        _deductUnlocked(m, amount);
+        // Home case: withdraw in the merchant's REGISTERED currency. Pay to the
+        // override handle if given, else the saved payout id.
+        string memory payout = m.payoutId;
+        if (bytes(payoutOverride).length > 0) payout = payoutOverride;
+        return _withdrawFiat(m, amount, circleId, m.currency, payout);
+    }
 
-        // Pay to the override UPI if given, else the merchant's saved UPI.
-        string memory payoutUpi = m.upiId;
-        if (bytes(upiOverride).length > 0) {
-            payoutUpi = upiOverride;
-        }
+    /// @notice Withdraw unlocked USDC as local fiat in ANY currency the protocol
+    ///         supports — not just the merchant's registered one. This lets a
+    ///         merchant cash out funds they ACCEPTED in another currency (e.g. a
+    ///         BRL payment) as that currency. Generic: the currency + payout are
+    ///         caller-supplied; the contract enforces only that funds are the
+    ///         merchant's own (per-merchant escrow + balance cap) and that the
+    ///         Diamond accepts the currency/circle pair (else it reverts safely
+    ///         and the USDC is recoverable via reconcileWithdrawal).
+    /// @param currency    The offramp currency (bytes32, e.g. "INR"|"BRL"). Non-zero.
+    /// @param payoutHandle Where this currency's fiat is paid (UPI/PIX/CBU/…). Non-empty.
+    function withdrawFiatIn(
+        uint256 amount,
+        uint256 circleId,
+        bytes32 currency,
+        string calldata payoutHandle
+    ) external nonReentrant returns (uint256 orderId) {
+        if (currency == bytes32(0)) revert InvalidCurrency();
+        if (bytes(payoutHandle).length == 0) revert InvalidAddress();
+        Merchant storage m = _checkWithdraw(amount);
+        return _withdrawFiat(m, amount, circleId, currency, payoutHandle);
+    }
+
+    /// @dev Shared core for both fiat-withdrawal entry points. Currency + payout
+    ///      are passed in (registered or chosen); everything else — per-merchant
+    ///      proxy isolation, balance debit, serialization, escrow tracking — is
+    ///      identical and currency-independent.
+    function _withdrawFiat(
+        Merchant storage m,
+        uint256 amount,
+        uint256 circleId,
+        bytes32 currency,
+        string memory payout
+    ) internal returns (uint256 orderId) {
+        if (circleId == 0) revert InvalidCircle(); // friendly local guard
+        // MED-1: serialize a merchant's fiat withdrawals. The merchant has ONE
+        // proxy, so two concurrent SELLs would commingle principals on it and a
+        // per-order top-up/reconcile (which key off the proxy's aggregate
+        // balance) could pay one order's fee out of another's escrow.
+        if (m.inFlightWithdrawals != 0) revert WithdrawalInFlight();
+        _deductUnlocked(m, amount);
 
         // Per-merchant proxy: funds for THIS merchant's SELL sit only on the
         // merchant's own proxy, never commingled with other merchants'.
-        address merchantProxy = _ensureProxy(msg.sender);
+        address merchantProxy = _ensureProxy(m.merchantAddr);
         usdc.safeTransfer(merchantProxy, amount);
         bytes memory data = abi.encodeCall(
             IB2BGateway.placeB2BSellOrder,
-            // currency pinned to INR; only the circle is caller-supplied.
-            (merchantProxy, amount, bytes32("INR"), payoutUpi, circleId, 0, 0)
+            (merchantProxy, amount, currency, payout, circleId, 0, 0)
         );
         bytes memory result = UserProxy(merchantProxy).execute(diamond, data, address(usdc), 0);
         orderId = abi.decode(result, (uint256));
 
         withdrawals[orderId] = PendingWithdrawal({
-            merchant: msg.sender,
+            merchant: m.merchantAddr,
             amount: amount,
             settled: false,
-            upiDelivered: false
+            upiDelivered: false,
+            feeAdvanced: 0
         });
+        m.inFlightWithdrawals++;
 
-        emit WithdrawalINR(msg.sender, orderId, amount);
+        emit WithdrawalFiat(m.merchantAddr, orderId, currency, amount);
     }
 
-    /// @notice Second step of an INR withdrawal: after the LP accepts the SELL
+    /// @notice Second step of a fiat withdrawal: after the LP accepts the SELL
     ///         order, the Diamond pulls `actualUsdtAmount` (= principal + fee)
     ///         from the merchant proxy via transferFrom during setSellOrderUpi.
-    ///         The proxy was funded with principal-only at withdrawINR, so this
+    ///         The proxy was funded with principal-only at withdrawFiat, so this
     ///         tops it up by the FEE from the integrator's USDC, grants the
     ///         allowance, and calls setSellOrderUpi so the Diamond can pull and
     ///         settle. Without this the Diamond auto-cancels the SELL (the
     ///         "fee bug"). Permissionless and idempotent: anyone may poke it once
     ///         the Diamond has populated actualUsdtAmount; only the recorded
-    ///         merchant benefits.
-    /// @param encUpi The Diamond-encrypted UPI payload for this order (built
-    ///        off-chain from the order's pubkey + the merchant's saved UPI),
-    ///        same as the BUY flow supplies a pubkey.
-    function deliverInrUpi(uint256 orderId, string calldata encUpi) external nonReentrant {
+    ///         merchant benefits. Currency-agnostic — works for any offramp.
+    /// @param encPayout The Diamond-encrypted payout payload for this order
+    ///        (built off-chain from the order's pubkey + the merchant's saved
+    ///        payout id), same as the BUY flow supplies a pubkey.
+    function deliverFiatPayout(uint256 orderId, string calldata encPayout) external nonReentrant {
         PendingWithdrawal storage w = withdrawals[orderId];
         if (w.merchant == address(0)) revert WithdrawalNotFound();
         if (w.settled) revert WithdrawalAlreadySettled();
         if (w.upiDelivered) revert WithdrawalAlreadySettled();
+
+        // HIGH-2: a frozen merchant's in-flight withdrawal must not settle.
+        // Freeze is the only fraud kill-switch, so this permissionless step has
+        // to honour it just like the withdraw entry point does.
+        Merchant storage m = merchants[w.merchant];
+        if (m.isFrozen) revert MerchantIsFrozen();
 
         // The Diamond pulls actualUsdtAmount (principal + fee) from order.user
         // (the merchant proxy) during setSellOrderUpi. Read it; refuse to run
@@ -386,21 +522,31 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         w.upiDelivered = true;
 
         address merchantProxy = _ensureProxy(w.merchant);
-        // The proxy already holds the principal (`w.amount`). Top up only the
-        // fee delta from the integrator's USDC so the proxy holds `needed`.
+        // The proxy holds this order's principal (`w.amount`). The Diamond needs
+        // `needed` = principal + fee, so we top up the fee delta — but HIGH-1:
+        // that fee is CHARGED TO THE WITHDRAWING MERCHANT (debited from their
+        // own unlocked buckets), never sourced from the commingled pool. The
+        // pool only physically forwards it; `totalOwed` drops by the fee, so the
+        // solvency invariant `balanceOf(this) >= totalOwed` is preserved.
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
         if (proxyBal < needed) {
             uint256 topUp = needed - proxyBal;
+            // Debit the fee from the merchant's own unlocked balance. Reverts
+            // InsufficientAvailableBalance if they can't cover it — the merchant
+            // pays their own offramp fee, exactly like any real withdrawal.
+            _deductUnlocked(m, topUp);
             if (usdc.balanceOf(address(this)) < topUp) revert OfframpInsufficientPool();
+            w.feeAdvanced = topUp; // recorded so reconcile attributes it exactly
             usdc.safeTransfer(merchantProxy, topUp);
         }
 
         // Grant the Diamond an allowance of exactly `needed` and call
-        // setSellOrderUpi. UserProxy.execute sweeps any remainder back to this
-        // integrator afterward.
+        // setSellOrderUpi. UserProxy.execute does NOT auto-sweep the USDC
+        // remainder; any surplus left on the proxy is recovered later by
+        // reconcileWithdrawal (which sweeps the full proxy balance).
         bytes memory data = abi.encodeCall(
             IOrderFlow.setSellOrderUpi,
-            (orderId, encUpi, 0)
+            (orderId, encPayout, 0)
         );
         UserProxy(merchantProxy).execute(diamond, data, address(usdc), needed);
 
@@ -431,6 +577,19 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         (2) we refuse to re-credit an order that shows evidence of fiat
     ///         delivery (an open/closed dispute), which would otherwise let a
     ///         merchant keep the INR AND reclaim USDC.
+    /// @notice Recover a fiat withdrawal whose SELL the Diamond CANCELLED. This
+    ///         covers BOTH the never-accepted (PLACED→CANCELLED) case AND the
+    ///         accepted-then-clawed-back (PAID→CANCELLED) case — in the latter
+    ///         the Diamond refunds principal+fee to the merchant's proxy, so the
+    ///         merchant did NOT keep fiat and must be made whole (NEW-1 fix: the
+    ///         old `upiDelivered` hard-block left PAID→CANCELLED unrecoverable
+    ///         and permanently stuck the in-flight slot).
+    ///
+    ///         Double-spend safety (the MED-2 concern) is enforced STRUCTURALLY,
+    ///         not by trusting a flag: we re-credit ONLY what is physically on
+    ///         the proxy. If fiat was truly delivered to the merchant, the Diamond
+    ///         did not refund the proxy, so proxyBal ≈ 0 and the re-credit is 0 —
+    ///         the merchant cannot reclaim USDC they already converted to fiat.
     function reconcileWithdrawal(uint256 orderId) external nonReentrant {
         PendingWithdrawal storage w = withdrawals[orderId];
         if (w.merchant == address(0)) revert UnknownWithdrawal();
@@ -438,33 +597,37 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
         IOrderFlow.OrderView memory order = IOrderFlow(diamond).getOrdersById(orderId);
         if (order.status != STATUS_CANCELLED) revert WithdrawalNotCancellable();
-        // Guard against double-spend: an order that carries any dispute may
-        // have had fiat delivered to the merchant's UPI before cancellation.
-        // Refuse to re-credit USDC in that case — the merchant already got INR.
+        // Refuse on any recorded dispute — a disputed order may have had fiat
+        // delivered; leave those to off-chain/admin resolution.
         if (order.disputeInfo.status != 0 || order.disputeInfo.raisedBy != 0)
             revert WithdrawalNotCancellable();
 
         w.settled = true;
+        Merchant storage m = merchants[w.merchant];
+        if (m.inFlightWithdrawals > 0) m.inFlightWithdrawals--;
 
-        // The cancelled order's USDC sits on the MERCHANT'S OWN proxy (funded
-        // at placement; the Diamond refunds there on cancel). Because the proxy
-        // is per-merchant, its balance is unambiguously this merchant's — no
-        // cross-merchant attribution problem. Cap by the recorded amount and by
-        // the proxy's actual balance (floor guard against a partial refund).
+        // MED-3: sweep the ENTIRE proxy balance back to the pool. Whatever the
+        // Diamond refunded (principal only for PLACED→CANCELLED, principal+fee
+        // for PAID→CANCELLED) is now physically here.
         address merchantProxy = _ensureProxy(w.merchant);
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
-        uint256 recovered = w.amount < proxyBal ? w.amount : proxyBal;
-        if (recovered > 0) {
-            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), recovered);
+        if (proxyBal > 0) {
+            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), proxyBal);
         }
 
-        // Re-credit the merchant exactly what was recovered for their order.
-        // Already past settlement (they withdrew from unlocked funds), so
-        // unlock immediately. unlockTimestamp must be strictly < now to count
-        // as available in getMerchantBalance, so use block.timestamp - 1.
-        _creditBucket(merchants[w.merchant], recovered, block.timestamp - 1);
+        // Re-credit principal + any fee advanced (the fee was charged to the
+        // merchant at delivery but no fiat was rendered, so refund it), capped by
+        // what was ACTUALLY refunded to the proxy (structural double-spend guard:
+        // no refund → no re-credit).
+        uint256 owedBack = w.amount + w.feeAdvanced;
+        uint256 recredit = owedBack < proxyBal ? owedBack : proxyBal;
+        // If the SELL had reached PAID (fiat was attempted), re-lock the credit
+        // under a fresh settlement window so the fraud/clawback control is
+        // preserved; the never-accepted case unlocks immediately (now-1).
+        uint256 unlockAt = w.upiDelivered ? block.timestamp + SETTLEMENT_PERIOD : block.timestamp - 1;
+        _creditBucket(m, recredit, unlockAt);
 
-        emit WithdrawalReconciled(w.merchant, orderId, recovered);
+        emit WithdrawalReconciled(w.merchant, orderId, recredit);
     }
 
     /// @notice Mark an INR withdrawal as successfully completed (frees the
@@ -478,6 +641,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         uint8 status = IOrderFlow(diamond).getOrdersById(orderId).status;
         if (status != STATUS_COMPLETED) revert WithdrawalNotCancellable();
         w.settled = true;
+        Merchant storage m = merchants[w.merchant];
+        if (m.inFlightWithdrawals > 0) m.inFlightWithdrawals--;
     }
 
     function _checkWithdraw(uint256 amount) internal view returns (Merchant storage m) {
@@ -488,10 +653,47 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     }
 
     /// @dev Append an unlocked/locked bucket, compacting fully-spent buckets
-    ///      first so the array stays bounded by MAX_BUCKETS.
+    ///      first so the array stays bounded by MAX_BUCKETS. Coalesces a new
+    ///      credit into an existing bucket with the SAME unlock timestamp so a
+    ///      merchant's live-bucket count cannot grow without bound (and the
+    ///      credit path can never revert at the cap and strand a deposit).
     function _creditBucket(Merchant storage m, uint256 amount, uint256 unlockTimestamp) internal {
+        if (amount == 0) return;
+        totalOwed += amount;
         _compact(m);
-        if (m.buckets.length >= MAX_BUCKETS) revert TooManyBuckets();
+        // Fold into an existing bucket sharing this unlock window if present.
+        uint256 len = m.buckets.length;
+        for (uint256 i = 0; i < len; i++) {
+            if (m.buckets[i].unlockTimestamp == unlockTimestamp) {
+                m.buckets[i].amount += amount;
+                return;
+            }
+        }
+        // No matching window — must append. If at the cap, fold the new credit
+        // into the oldest live bucket rather than revert: this keeps the credit
+        // path infallible (a completed deposit can ALWAYS be recorded).
+        if (m.buckets.length >= MAX_BUCKETS) {
+            uint256 oldest = 0;
+            uint256 oldestTs = type(uint256).max;
+            for (uint256 i = 0; i < len; i++) {
+                if (m.buckets[i].unlockTimestamp < oldestTs) {
+                    oldestTs = m.buckets[i].unlockTimestamp;
+                    oldest = i;
+                }
+            }
+            // The folded credit adopts the LATER of the two unlock times, so it
+            // can never unlock EARLIER than its own intended time, and — NEW-2
+            // fix — it never lowers an already-locked bucket's unlock below
+            // block.timestamp (a past-dated reconcile credit must not make the
+            // host bucket's locked principal spendable early). The folded credit
+            // may unlock slightly later than requested; that is the safe
+            // direction at the (rare) cap.
+            if (unlockTimestamp > m.buckets[oldest].unlockTimestamp) {
+                m.buckets[oldest].unlockTimestamp = unlockTimestamp;
+            }
+            m.buckets[oldest].amount += amount;
+            return;
+        }
         m.buckets.push(SettlementBucket({ amount: amount, unlockTimestamp: unlockTimestamp }));
     }
 
@@ -529,6 +731,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         }
         if (unlocked < amount) revert InsufficientAvailableBalance();
 
+        totalOwed -= amount;
         uint256 remaining = amount;
         for (uint256 i = 0; i < len && remaining > 0; i++) {
             SettlementBucket storage b = m.buckets[i];
@@ -549,6 +752,82 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     function unfreezeMerchant(address merchant) external onlyOwner {
         merchants[merchant].isFrozen = false;
         emit MerchantUnfrozen(merchant);
+    }
+
+    /// @notice HIGH-2 admin recovery: claw a FROZEN merchant's in-flight, not-yet-
+    ///         delivered fiat withdrawal back into the pool, independent of the
+    ///         Diamond's order status. Only callable while the merchant is frozen
+    ///         and only for a withdrawal whose fiat was never delivered
+    ///         (upiDelivered == false) — so it can never reverse a real payout.
+    ///         Sweeps the merchant's proxy USDC back, re-credits their principal
+    ///         (locked again under a fresh settlement period so a frozen account
+    ///         can't immediately re-extract), and frees the in-flight slot.
+    function adminAbortWithdrawal(uint256 orderId) external onlyOwner nonReentrant {
+        PendingWithdrawal storage w = withdrawals[orderId];
+        if (w.merchant == address(0)) revert UnknownWithdrawal();
+        if (w.settled) revert WithdrawalAlreadySettled();
+        if (w.upiDelivered) revert FiatAlreadyDelivered();
+        Merchant storage m = merchants[w.merchant];
+        if (!m.isFrozen) revert MerchantIsFrozen(); // only for frozen accounts
+
+        w.settled = true;
+        if (m.inFlightWithdrawals > 0) m.inFlightWithdrawals--;
+
+        address merchantProxy = _ensureProxy(w.merchant);
+        uint256 proxyBal = usdc.balanceOf(merchantProxy);
+        if (proxyBal > 0) {
+            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), proxyBal);
+        }
+        // Make the merchant whole for principal + any fee advanced (capped by
+        // the actual proxy refund, so still double-spend-safe).
+        uint256 owedBack = w.amount + w.feeAdvanced;
+        uint256 recredit = owedBack < proxyBal ? owedBack : proxyBal;
+        // Re-lock under a fresh settlement window — a frozen merchant shouldn't
+        // get instantly-available funds back; unfreeze + normal flow applies.
+        _creditBucket(m, recredit, block.timestamp + SETTLEMENT_PERIOD);
+
+        emit WithdrawalReconciled(w.merchant, orderId, recredit);
+    }
+
+    /// @notice FINAL-AUDIT fix (disputed-clawback channel-brick): an owner-gated
+    ///         recovery for an in-flight withdrawal that NO other settle path can
+    ///         close — specifically a PAID→disputed→CANCELLED order, where
+    ///         reconcileWithdrawal refuses the dispute, finalizeWithdrawal needs
+    ///         COMPLETED, and adminAbortWithdrawal refuses upiDelivered. Without
+    ///         this, inFlightWithdrawals stays stuck (bricking the merchant's
+    ///         whole fiat channel) and the Diamond's proxy refund is stranded.
+    ///
+    ///         Double-spend safety is structural and unconditional: we re-credit
+    ///         ONLY what is physically refunded to the proxy. If fiat actually
+    ///         reached the merchant, the Diamond did not refund the proxy, so
+    ///         proxyBal ≈ 0 and recredit ≈ 0. Owner-gated and requires the
+    ///         Diamond status to be CANCELLED (a real clawback), so it cannot be
+    ///         used to reverse a COMPLETED payout.
+    function adminForceSettle(uint256 orderId) external onlyOwner nonReentrant {
+        PendingWithdrawal storage w = withdrawals[orderId];
+        if (w.merchant == address(0)) revert UnknownWithdrawal();
+        if (w.settled) revert WithdrawalAlreadySettled();
+
+        // Only for orders the Diamond clawed back — never a completed payout.
+        uint8 status = IOrderFlow(diamond).getOrdersById(orderId).status;
+        if (status != STATUS_CANCELLED) revert WithdrawalNotCancellable();
+
+        w.settled = true;
+        Merchant storage m = merchants[w.merchant];
+        if (m.inFlightWithdrawals > 0) m.inFlightWithdrawals--;
+
+        address merchantProxy = _ensureProxy(w.merchant);
+        uint256 proxyBal = usdc.balanceOf(merchantProxy);
+        if (proxyBal > 0) {
+            UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), proxyBal);
+        }
+        // Make whole for principal + fee, capped by the physical refund.
+        uint256 owedBack = w.amount + w.feeAdvanced;
+        uint256 recredit = owedBack < proxyBal ? owedBack : proxyBal;
+        // Re-lock under a fresh settlement window (the order had reached PAID).
+        _creditBucket(m, recredit, block.timestamp + SETTLEMENT_PERIOD);
+
+        emit WithdrawalReconciled(w.merchant, orderId, recredit);
     }
 
     // ─── Views ────────────────────────────────────────────────────────
@@ -584,17 +863,17 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     }
 
     /// @notice On-chain merchant profile, so the UI needs no off-chain store.
-    ///         Returns the saved UPI (where INR withdrawals are paid),
-    ///         registration status, and freeze status.
+    ///         Returns the saved payout id (where fiat withdrawals are paid),
+    ///         shop name, offramp currency, registration status, and freeze status.
     function getMerchantInfo(
         address merchant
     )
         external
         view
-        returns (string memory upiId, string memory shopName, bool isRegistered, bool isFrozen)
+        returns (string memory payoutId, string memory shopName, bytes32 currency, bool isRegistered, bool isFrozen)
     {
         Merchant storage m = merchants[merchant];
-        return (m.upiId, m.shopName, registered[merchant], m.isFrozen);
+        return (m.payoutId, m.shopName, m.currency, registered[merchant], m.isFrozen);
     }
 
     function getDailyTxInfo(
@@ -604,6 +883,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         uint256 today = block.timestamp / 86400;
         usedToday = m.lastTxDate == today ? m.dailyTxCount : 0;
         return (usedToday, DAILY_TX_LIMIT);
+    }
+
+    /// @notice The merchant's offramp currency as a readable code ("INR",
+    ///         "BRL", …) — so the UI never has to decode a bytes32.
+    function getMerchantCurrency(address merchant) external view returns (string memory) {
+        return fromCurrency(merchants[merchant].currency);
     }
 
     // ─── Proxy helpers (mirror ExampleIntegrator exactly) ─────────────

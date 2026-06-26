@@ -15,7 +15,7 @@ import { INTEGRATOR_ABI, CONTRACT_ADDRESS, CLIENT_ADDRESS, PRODUCT_ID } from "./
 // The team's Base Sepolia subgraph — enables automatic circle selection.
 export const SUBGRAPH_URL =
   process.env.NEXT_PUBLIC_SUBGRAPH_URL ||
-  "https://api.studio.thegraph.com/query/1745491/event-indexer/v0.0.4";
+  "https://api.studio.thegraph.com/query/1745491/event-indexer/v0.0.6";
 
 export const USDC_ADDRESS = process.env.NEXT_PUBLIC_USDC_ADDRESS || "";
 export const DIAMOND_ADDRESS = process.env.NEXT_PUBLIC_DIAMOND_ADDRESS || "";
@@ -27,25 +27,70 @@ export const CURRENCIES = [{ symbol: "INR", flag: "🇮🇳", paymentMethod: "UP
 const INR_HEX =
   "0x494e520000000000000000000000000000000000000000000000000000000000";
 
+// ── Generic currency ⇄ bytes32 (no per-country hardcoding) ──────────
+// The subgraph stores a currency as a left-aligned bytes32 of the ASCII code.
+// e.g. "INR" → 0x494e52…00 , "BRL" → 0x42524c…00.
+export function codeToHex(code: string): string {
+  let hex = "0x";
+  for (let i = 0; i < 32; i++) {
+    const ch = i < code.length ? code.charCodeAt(i) : 0;
+    hex += ch.toString(16).padStart(2, "0");
+  }
+  return hex.toLowerCase();
+}
+export function hexToCode(hex: string): string {
+  const h = hex.replace(/^0x/, "");
+  let out = "";
+  for (let i = 0; i < h.length; i += 2) {
+    const b = parseInt(h.slice(i, i + 2), 16);
+    if (b === 0) break;
+    out += String.fromCharCode(b);
+  }
+  return out;
+}
+
+let _circlesCache: { at: number; rows: { circleId: bigint; code: string }[] } | null = null;
+
 /**
- * Resolve the INR circle id from the subgraph (the same source the widget uses
- * for BUY orders) so withdrawINR doesn't hardcode it. Returns a bigint circleId.
- * Falls back to 1 if the subgraph is unreachable (INR has been circle 1 across
- * all live orders) — the contract + Diamond still validate it.
+ * GENERIC: fetch every currency the protocol can settle, straight from the live
+ * "circles" on the subgraph. This is the single source of truth — whatever the
+ * protocol funds appears here automatically, with NO per-country code. Cached
+ * 60s. Returns [{ circleId, code }] e.g. [{1,"INR"},{2,"BRL"}, …future…].
  */
-export async function resolveInrCircleId() {
+export async function fetchSupportedCurrencies(): Promise<{ circleId: bigint; code: string }[]> {
+  if (_circlesCache && Date.now() - _circlesCache.at < 60_000) return _circlesCache.rows;
   try {
     const res = await fetch(SUBGRAPH_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query: `{ circles(first: 50) { circleId currency } }` }),
+      body: JSON.stringify({ query: `{ circles(first: 100) { circleId currency } }` }),
     });
     const json = await res.json();
-    const inr = (json.data?.circles || []).find((c) => c.currency === INR_HEX);
-    return inr ? BigInt(inr.circleId) : 1n;
+    const rows = (json.data?.circles || [])
+      .map((c: any) => ({ circleId: BigInt(c.circleId), code: hexToCode(c.currency) }))
+      .filter((r: any) => r.code.length > 0);
+    _circlesCache = { at: Date.now(), rows };
+    return rows;
   } catch {
-    return 1n;
+    // offline fallback — the known-live circles so the UI still works
+    return [{ circleId: 1n, code: "INR" }, { circleId: 2n, code: "BRL" }];
   }
+}
+
+/**
+ * GENERIC: resolve the circle id for ANY currency code. Returns null if the
+ * protocol has no funded circle for it (→ the UI hides/disables that currency).
+ */
+export async function resolveCircleId(code: string): Promise<bigint | null> {
+  const list = await fetchSupportedCurrencies();
+  return list.find((c) => c.code === code)?.circleId ?? null;
+}
+
+/**
+ * INR-specific shim (kept for callers that still use it). Prefer resolveCircleId.
+ */
+export async function resolveInrCircleId() {
+  return (await resolveCircleId("INR")) ?? 1n;
 }
 
 /**
@@ -97,7 +142,7 @@ export function makePlaceOrder({ signer, publicClient, quantity, getIdentity }) 
     for (const log of receipt.logs) {
       try {
         const { decodeEventLog } = await import("viem");
-        const ev = decodeEventLog({ abi: INTEGRATOR_ABI, data: log.data, topics: log.topics });
+        const ev: any = decodeEventLog({ abi: INTEGRATOR_ABI, data: log.data, topics: log.topics });
         if (ev.eventName === "OrderPlaced") {
           orderId = ev.args.orderId.toString();
           break;

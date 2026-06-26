@@ -6,6 +6,7 @@ import { WagmiProvider, createConfig } from "@privy-io/wagmi";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { http } from "viem";
 import { ACTIVE_CHAIN, RPC_URL } from "../lib/chain";
+import { ThemeProvider } from "../components/theme";
 
 const wagmiConfig = createConfig({
   chains: [ACTIVE_CHAIN],
@@ -34,12 +35,13 @@ const queryClient = new QueryClient({
 
 export function Providers({ children }) {
   return (
+    <ThemeProvider>
     <PrivyProvider
       appId={process.env.NEXT_PUBLIC_PRIVY_APP_ID}
       config={{
         // No loginMethods override — Privy shows every login method enabled
         // in the dashboard (dashboard.privy.io -> your app -> Login methods).
-        appearance: { theme: "light", accentColor: "#5b4cf0" },
+        appearance: { theme: "dark", accentColor: "#5b4cf0" },
         // Gas is sponsored by the Pimlico paymaster, so per-transaction
         // confirmation modals add no value — suppress them for a one-tap flow.
         embeddedWallets: {
@@ -50,13 +52,16 @@ export function Providers({ children }) {
         supportedChains: [ACTIVE_CHAIN],
       }}
     >
-      {/* Smart wallets (Kernel) — gas sponsored by the Pimlico paymaster
-          configured in the Privy dashboard. Merchants transact with 0 ETH. */}
-      <SmartWalletsProvider>
-        <QueryClientProvider client={queryClient}>
-          <WagmiProvider config={wagmiConfig}>{children}</WagmiProvider>
-        </QueryClientProvider>
-      </SmartWalletsProvider>
+      {/* Nesting per Privy docs: SmartWalletsProvider must sit INSIDE
+          WagmiProvider, otherwise useSmartWallets().client is null and the
+          smart-wallet address never resolves.
+          PrivyProvider > QueryClient > Wagmi > SmartWallets > App */}
+      <QueryClientProvider client={queryClient}>
+        <WagmiProvider config={wagmiConfig}>
+          <SmartWalletsProvider>{children}</SmartWalletsProvider>
+        </WagmiProvider>
+      </QueryClientProvider>
     </PrivyProvider>
+    </ThemeProvider>
   );
 }

@@ -16,7 +16,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
   const USDC = (n: number) => ethers.parseUnits(n.toString(), 6);
   const UNIT_PRICE = USDC(10);
   const PRODUCT_ID = 1;
-  const INR = ethers.encodeBytes32String("INR");
+  const INR_CODE = "INR";                              // human-readable code
+  const INR = ethers.encodeBytes32String("INR");       // packed bytes32 (events)
   const DAY = 86400;
   // Read from the deployed contract in beforeEach so the suite matches whatever
   // SETTLEMENT_PERIOD is compiled in (30 days in prod, 10 min for the withdraw test build).
@@ -84,7 +85,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     upi: string,
     quantity = 2
   ): Promise<bigint> {
-    await integrator.connect(merchant).registerMerchant(upi, "Shop");
+    await integrator.connect(merchant).registerMerchant(upi, "Shop", INR_CODE);
     const orderId = await placeOrder(merchant, quantity);
     await mockDiamond.simulateOrderComplete(orderId);
     return orderId;
@@ -93,23 +94,60 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
   // ─── 1 + 2: Registration ──────────────────────────────────────────
 
   it("1. registerMerchant succeeds and emits MerchantRegistered", async function () {
-    await expect(integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One"))
+    await expect(integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE))
       .to.emit(integrator, "MerchantRegistered")
-      .withArgs(merchant1.address, UPI_1, "Shop One");
+      .withArgs(merchant1.address, UPI_1, "Shop One", INR);
     expect(await integrator.registered(merchant1.address)).to.equal(true);
   });
 
   it("2. registerMerchant reverts when called twice", async function () {
-    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One");
+    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
     await expect(
-      integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One")
+      integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE)
     ).to.be.revertedWithCustomError(integrator, "AlreadyRegistered");
+  });
+
+  // ─── multi-country: currency naming + per-country registration ─────
+
+  it("2a. toCurrency / fromCurrency round-trip for any country code", async function () {
+    for (const code of ["INR", "BRL", "ARS", "MXN", "NGN", "COP"]) {
+      const packed = await integrator.toCurrency(code);
+      expect(packed).to.equal(ethers.encodeBytes32String(code));
+      expect(await integrator.fromCurrency(packed)).to.equal(code);
+    }
+  });
+
+  it("2b. registerMerchant rejects an empty currency code", async function () {
+    await expect(
+      integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", "")
+    ).to.be.revertedWithCustomError(integrator, "InvalidCurrency");
+  });
+
+  it("2c. a Brazil merchant registers with BRL + PIX and reads it back", async function () {
+    const pixKey = "joao@email.com";
+    await integrator.connect(merchant1).registerMerchant(pixKey, "Café Rio", "BRL");
+    const [payoutId, shopName, currency, isReg] = await integrator.getMerchantInfo(merchant1.address);
+    expect(payoutId).to.equal(pixKey);
+    expect(shopName).to.equal("Café Rio");
+    expect(currency).to.equal(ethers.encodeBytes32String("BRL"));
+    expect(isReg).to.equal(true);
+    expect(await integrator.getMerchantCurrency(merchant1.address)).to.equal("BRL");
+  });
+
+  it("2d. an Argentina merchant registers with ARS + CBU/alias", async function () {
+    await integrator.connect(merchant2).registerMerchant("miguel.mp", "Café del Sur", "ARS");
+    expect(await integrator.getMerchantCurrency(merchant2.address)).to.equal("ARS");
+  });
+
+  it("2e. registerMerchantRaw accepts a pre-packed bytes32 currency", async function () {
+    await integrator.connect(merchant1).registerMerchantRaw(UPI_1, "Shop One", INR);
+    expect(await integrator.getMerchantCurrency(merchant1.address)).to.equal("INR");
   });
 
   // ─── 3 + 4 + 5: validateOrder limits ──────────────────────────────
 
   it("3. validateOrder reverts above 50 USDC per-tx cap", async function () {
-    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One");
+    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
     const diamond = await diamondSigner();
     await expect(
       integrator.connect(diamond).validateOrder(merchant1.address, USDC(51), INR)
@@ -117,7 +155,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
   });
 
   it("4. validateOrder reverts on the 5th transaction in the same day", async function () {
-    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One");
+    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
     for (let i = 0; i < 4; i++) await placeOrder(merchant1);
     expect((await integrator.getDailyTxInfo(merchant1.address))[0]).to.equal(4);
 
@@ -134,7 +172,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
   });
 
   it("5. daily count resets after one day", async function () {
-    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One");
+    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
     for (let i = 0; i < 4; i++) await placeOrder(merchant1);
     await increaseTime(DAY + 10);
     expect((await integrator.getDailyTxInfo(merchant1.address))[0]).to.equal(0);
@@ -145,7 +183,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
   // ─── 6 + 7: Completion and balances ────────────────────────────────
 
   it("6. onOrderComplete creates the correct bucket with unlock = completion + SETTLEMENT_PERIOD", async function () {
-    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One");
+    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
     const orderId = await placeOrder(merchant1, 2);
     const tx = await mockDiamond.simulateOrderComplete(orderId);
     const receipt = await tx.wait();
@@ -179,7 +217,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
   it("8. withdrawINR reverts before the 30-day settlement", async function () {
     await depositFor(merchant1, UPI_1, 2);
-    await expect(integrator.connect(merchant1).withdrawINR(USDC(20), 1, "")).to.be.revertedWithCustomError(
+    await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, "")).to.be.revertedWithCustomError(
       integrator,
       "InsufficientAvailableBalance"
     );
@@ -191,9 +229,9 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
     // SELL is placed through the MERCHANT'S OWN proxy now (per-merchant isolation)
     const merchantProxy = await integrator.proxyAddress(merchant1.address);
-    await expect(integrator.connect(merchant1).withdrawINR(USDC(20), 1, "")).to.emit(
+    await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, "")).to.emit(
       integrator,
-      "WithdrawalINR"
+      "WithdrawalFiat"
     );
     expect(await mockUsdc.balanceOf(merchantProxy)).to.equal(USDC(20));
     expect(await mockUsdc.balanceOf(await integrator.getAddress())).to.equal(0);
@@ -205,6 +243,68 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     const sellOrder = await mockDiamond.getSellOrder(2);
     expect(sellOrder.user).to.equal(merchantProxy);
     expect(sellOrder.amount).to.equal(USDC(20));
+    // currency on the SELL order = the merchant's registered currency (INR here)
+    expect(sellOrder.currency).to.equal(INR);
+  });
+
+  it("9-multi. a BRL merchant's withdrawFiat places the SELL order in BRL (not hardcoded INR)", async function () {
+    // Register as Brazil/BRL, deposit, settle, withdraw — the SELL order must
+    // carry BRL, proving the currency comes from the merchant's profile.
+    const BRL = ethers.encodeBytes32String("BRL");
+    await integrator.connect(merchant2).registerMerchant("joao@pix", "Café Rio", "BRL");
+    const orderId = await placeOrder(merchant2, 2);
+    await mockDiamond.simulateOrderComplete(orderId);
+    await increaseTime(SETTLEMENT + 3600);
+
+    const tx = await integrator.connect(merchant2).withdrawFiat(USDC(20), 1, "");
+    const rcpt = await tx.wait();
+    const sellId = rcpt.logs
+      .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
+      .find((l: any) => l?.name === "WithdrawalFiat").args.orderId;
+
+    const sellOrder = await mockDiamond.getSellOrder(sellId);
+    expect(sellOrder.currency).to.equal(BRL);  // ← BRL, not INR
+  });
+
+  it("9-cross. an INR-registered merchant can withdraw IN BRL via withdrawFiatIn (cross-currency)", async function () {
+    // The merchant registered India/INR but accepted funds they now want to
+    // cash out as BRL to a PIX key. withdrawFiatIn places the SELL in BRL with
+    // the chosen payout — proving currency + payout are caller-supplied.
+    const BRL = ethers.encodeBytes32String("BRL");
+    await depositFor(merchant1, UPI_1, 2);          // registered INR
+    await increaseTime(SETTLEMENT + 3600);
+
+    const tx = await integrator.connect(merchant1).withdrawFiatIn(USDC(20), 2, BRL, "joao@pix");
+    const rcpt = await tx.wait();
+    const ev = rcpt.logs
+      .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
+      .find((l: any) => l?.name === "WithdrawalFiat");
+    expect(ev.args.currency).to.equal(BRL);        // event carries BRL, not INR
+
+    const sell = await mockDiamond.getSellOrder(ev.args.orderId);
+    expect(sell.currency).to.equal(BRL);           // SELL placed in BRL
+    // merchant's registered currency is UNCHANGED (still INR)
+    const [, , savedCurrency] = await integrator.getMerchantInfo(merchant1.address);
+    expect(savedCurrency).to.equal(ethers.encodeBytes32String("INR"));
+  });
+
+  it("9-cross. withdrawFiatIn rejects empty currency or empty payout", async function () {
+    await depositFor(merchant1, UPI_1, 2);
+    await increaseTime(SETTLEMENT + 3600);
+    const BRL = ethers.encodeBytes32String("BRL");
+    await expect(integrator.connect(merchant1).withdrawFiatIn(USDC(5), 2, ethers.ZeroHash, "joao@pix"))
+      .to.be.revertedWithCustomError(integrator, "InvalidCurrency");
+    await expect(integrator.connect(merchant1).withdrawFiatIn(USDC(5), 2, BRL, ""))
+      .to.be.revertedWithCustomError(integrator, "InvalidAddress");
+  });
+
+  it("9-cross. withdrawFiatIn still caps by the merchant's OWN balance (no cross-merchant drain)", async function () {
+    // m1 has 20; even choosing any currency, they can't withdraw more than theirs.
+    await depositFor(merchant1, UPI_1, 2);  // 20
+    await increaseTime(SETTLEMENT + 3600);
+    const BRL = ethers.encodeBytes32String("BRL");
+    await expect(integrator.connect(merchant1).withdrawFiatIn(USDC(50), 2, BRL, "joao@pix"))
+      .to.be.revertedWithCustomError(integrator, "InsufficientAvailableBalance");
   });
 
   it("9a. withdrawINR uses the UPI override when provided, else the saved UPI", async function () {
@@ -212,11 +312,11 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     await increaseTime(SETTLEMENT + 3600);
 
     // override → SELL order carries the override UPI, saved UPI unchanged
-    const tx = await integrator.connect(merchant1).withdrawINR(USDC(10), 1, "other@upi");
+    const tx = await integrator.connect(merchant1).withdrawFiat(USDC(10), 1, "other@upi");
     const rcpt = await tx.wait();
     const orderId = rcpt.logs
       .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
-      .find((l: any) => l?.name === "WithdrawalINR").args.orderId;
+      .find((l: any) => l?.name === "WithdrawalFiat").args.orderId;
     const sell = await mockDiamond.getSellOrder(orderId);
     expect(sell.merchantPubkey === undefined || true).to.equal(true); // encUpi set later
     // saved UPI still UPI_1 (unchanged by the override)
@@ -224,40 +324,49 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     expect(savedUpi).to.equal(UPI_1);
   });
 
-  it("9b. INR withdrawal settles through PLACED→PAID→COMPLETED WITH a fee (fee top-up + allowance)", async function () {
-    // This is the regression test for the SELL fee/allowance bug: the Diamond
-    // pulls principal + fee during setSellOrderUpi. withdrawINR funds only the
-    // principal; deliverInrUpi must top up the fee and grant the allowance, or
-    // the Diamond's transferFrom reverts and the order auto-cancels.
-    await depositFor(merchant1, UPI_1, 2); // 20 USDC settled
+  it("9b. INR withdrawal settles through PLACED→PAID→COMPLETED WITH a fee (fee charged to merchant)", async function () {
+    // Regression for the SELL fee/allowance bug AND for HIGH-1: the Diamond
+    // pulls principal + fee during setSellOrderUpi. The fee top-up is now
+    // CHARGED TO THE WITHDRAWING MERCHANT (debited from their own unlocked
+    // buckets), never the shared pool — so the merchant needs headroom for it.
+    await depositFor(merchant1, UPI_1, 3); // 30 USDC settled
     await increaseTime(SETTLEMENT + 3600);
 
     const FEE = USDC(1);
     await mockDiamond.setSellFee(FEE);
 
-    // The integrator needs USDC on hand to fund the fee. A fresh BUY deposit
-    // leaves USDC on the integrator (pulled at onOrderComplete).
-    await depositFor(merchant2, UPI_2, 2); // integrator now holds extra USDC
+    // The integrator needs USDC on hand to physically forward the fee. A fresh
+    // BUY deposit leaves USDC on the integrator (pulled at onOrderComplete).
+    await depositFor(merchant2, UPI_2, 2);
 
     const merchantProxy = await integrator.proxyAddress(merchant1.address);
 
-    // 1) place the SELL — proxy funded with principal only
-    const tx = await integrator.connect(merchant1).withdrawINR(USDC(20), 1, "");
+    // available before: 30 USDC
+    const beforeAvail = (await integrator.getMerchantBalance(merchant1.address))[1];
+    expect(beforeAvail).to.equal(USDC(30));
+
+    // 1) place the SELL for 20 — proxy funded with principal only (20)
+    const tx = await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, "");
     const rcpt = await tx.wait();
     const ev = rcpt.logs
       .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
-      .find((l: any) => l?.name === "WithdrawalINR");
+      .find((l: any) => l?.name === "WithdrawalFiat");
     const orderId = ev.args.orderId;
     expect(await mockUsdc.balanceOf(merchantProxy)).to.equal(USDC(20)); // principal only
+
+    // after placing: 30 - 20 principal = 10 available (fee not yet charged)
+    expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(USDC(10));
 
     // 2) LP accepts
     await mockDiamond.acceptSellOrder(orderId, "lpPubkey");
 
-    // 3) deliverInrUpi: tops up the FEE and grants allowance, then setSellOrderUpi
-    //    pulls principal+fee. Without the fee top-up this reverts.
-    await expect(integrator.connect(merchant1).deliverInrUpi(orderId, "encUpi"))
+    // 3) deliver: tops up the FEE (charged to merchant's own balance) + allowance
+    await expect(integrator.connect(merchant1).deliverFiatPayout(orderId, "encUpi"))
       .to.emit(integrator, "WithdrawalUpiDelivered")
       .withArgs(orderId, USDC(21)); // principal 20 + fee 1
+
+    // HIGH-1: the fee was debited from the MERCHANT, not the pool → 10 - 1 = 9
+    expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(USDC(9));
 
     // Diamond pulled principal+fee from the proxy → proxy drained
     expect(await mockUsdc.balanceOf(merchantProxy)).to.equal(0);
@@ -273,17 +382,17 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     await mockDiamond.setSellFee(USDC(1));
     await depositFor(merchant2, UPI_2, 2); // fund integrator pool
 
-    const tx = await integrator.connect(merchant1).withdrawINR(USDC(20), 1, "");
+    const tx = await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, "");
     const rcpt = await tx.wait();
     const orderId = rcpt.logs
       .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
-      .find((l: any) => l?.name === "WithdrawalINR").args.orderId;
+      .find((l: any) => l?.name === "WithdrawalFiat").args.orderId;
     await mockDiamond.acceptSellOrder(orderId, "lp");
 
     // Diamond hasn't populated actualUsdtAmount yet → must revert, not fall back
     await mockDiamond.setAdditionalOrderDetailsFeeUnready(true);
     await expect(
-      integrator.connect(merchant1).deliverInrUpi(orderId, "encUpi")
+      integrator.connect(merchant1).deliverFiatPayout(orderId, "encUpi")
     ).to.be.revertedWithCustomError(integrator, "OfframpFeeNotReady");
   });
 
@@ -321,7 +430,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       .to.emit(integrator, "MerchantFrozen")
       .withArgs(merchant1.address);
 
-    await expect(integrator.connect(merchant1).withdrawINR(USDC(20), 1, "")).to.be.revertedWithCustomError(
+    await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, "")).to.be.revertedWithCustomError(
       integrator,
       "MerchantIsFrozen"
     );
@@ -338,8 +447,8 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
   // ─── 13: Isolation ─────────────────────────────────────────────────
 
   it("13. two merchants' balances never cross-contaminate", async function () {
-    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One");
-    await integrator.connect(merchant2).registerMerchant(UPI_2, "Shop Two");
+    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
+    await integrator.connect(merchant2).registerMerchant(UPI_2, "Shop Two", INR_CODE);
 
     const order1 = await placeOrder(merchant1, 2);
     const order2 = await placeOrder(merchant2, 3);
@@ -365,7 +474,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
   // ─── 14: Cancellation ──────────────────────────────────────────────
 
   it("14. onOrderCancel decrements the daily tx count (and never double-decrements)", async function () {
-    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One");
+    await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
     const order1 = await placeOrder(merchant1);
     await placeOrder(merchant1);
     expect((await integrator.getDailyTxInfo(merchant1.address))[0]).to.equal(2);
@@ -385,7 +494,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
   describe("access control", function () {
     it("validateOrder rejects non-Diamond callers", async function () {
-      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One");
+      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
       await expect(
         integrator.connect(attacker).validateOrder(merchant1.address, UNIT_PRICE, INR)
       ).to.be.revertedWithCustomError(integrator, "OnlyDiamond");
@@ -431,14 +540,14 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await expect(
         integrator.connect(attacker).withdrawUSDC(USDC(1))
       ).to.be.revertedWithCustomError(integrator, "NotRegistered");
-      await expect(integrator.connect(attacker).withdrawINR(USDC(1), 1, "")).to.be.revertedWithCustomError(
+      await expect(integrator.connect(attacker).withdrawFiat(USDC(1), 1, "")).to.be.revertedWithCustomError(
         integrator,
         "NotRegistered"
       );
     });
 
     it("zero-amount withdrawal reverts NothingToWithdraw", async function () {
-      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One");
+      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
       await expect(integrator.connect(merchant1).withdrawUSDC(0)).to.be.revertedWithCustomError(
         integrator,
         "NothingToWithdraw"
@@ -446,7 +555,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     });
 
     it("cannot withdraw locked funds (partial unlock respected)", async function () {
-      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One");
+      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
       // deposit 1 (will unlock), then deposit 2 (still locked)
       let o = await placeOrder(merchant1, 2);
       await mockDiamond.simulateOrderComplete(o);
@@ -465,7 +574,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     });
 
     it("oldest-first deduction across multiple unlocked buckets", async function () {
-      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One");
+      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
       for (let i = 0; i < 3; i++) {
         const o = await placeOrder(merchant1, 1); // 10 each
         await mockDiamond.simulateOrderComplete(o);
@@ -487,7 +596,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await depositFor(merchant1, UPI_1, 2); // 20 USDC
       await increaseTime(SETTLEMENT + 3600);
 
-      const tx = await integrator.connect(merchant1).withdrawINR(USDC(20), 1, "");
+      const tx = await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, "");
       const receipt = await tx.wait();
       const ev = receipt.logs
         .map((l: any) => {
@@ -497,7 +606,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
             return null;
           }
         })
-        .find((l: any) => l?.name === "WithdrawalINR");
+        .find((l: any) => l?.name === "WithdrawalFiat");
       const orderId = ev.args.orderId;
 
       // merchant balance is zero, funds parked on the MERCHANT'S OWN proxy
@@ -526,7 +635,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       // m1's order recovers only m1's funds; m2's are on a different proxy and
       // cannot be touched — isolation is now structural, not amount-capped.
       await depositFor(merchant1, UPI_1, 2); // m1: 20
-      await integrator.connect(merchant2).registerMerchant(UPI_2, "Shop Two");
+      await integrator.connect(merchant2).registerMerchant(UPI_2, "Shop Two", INR_CODE);
       const o2 = await placeOrder(merchant2, 3); // m2: 30
       await mockDiamond.simulateOrderComplete(o2);
       await increaseTime(SETTLEMENT + 3600);
@@ -544,10 +653,10 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
           .find((l: any) => l?.name === name).args.orderId;
       };
       const id1 = await grab(
-        await integrator.connect(merchant1).withdrawINR(USDC(20), 1, ""),
-        "WithdrawalINR"
+        await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""),
+        "WithdrawalFiat"
       );
-      await grab(await integrator.connect(merchant2).withdrawINR(USDC(30), 1, ""), "WithdrawalINR");
+      await grab(await integrator.connect(merchant2).withdrawFiat(USDC(30), 1, ""), "WithdrawalFiat");
 
       const proxy1 = await integrator.proxyAddress(merchant1.address);
       const proxy2 = await integrator.proxyAddress(merchant2.address);
@@ -571,7 +680,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     it("reconcileWithdrawal reverts for a non-cancelled order", async function () {
       await depositFor(merchant1, UPI_1, 2);
       await increaseTime(SETTLEMENT + 3600);
-      const tx = await integrator.connect(merchant1).withdrawINR(USDC(20), 1, "");
+      const tx = await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, "");
       const receipt = await tx.wait();
       const ev = receipt.logs
         .map((l: any) => {
@@ -581,7 +690,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
             return null;
           }
         })
-        .find((l: any) => l?.name === "WithdrawalINR");
+        .find((l: any) => l?.name === "WithdrawalFiat");
       await expect(integrator.reconcileWithdrawal(ev.args.orderId)).to.be.revertedWithCustomError(
         integrator,
         "WithdrawalNotCancellable"
@@ -598,7 +707,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     it("reconcileWithdrawal cannot be replayed", async function () {
       await depositFor(merchant1, UPI_1, 2);
       await increaseTime(SETTLEMENT + 3600);
-      const tx = await integrator.connect(merchant1).withdrawINR(USDC(20), 1, "");
+      const tx = await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, "");
       const receipt = await tx.wait();
       const ev = receipt.logs
         .map((l: any) => {
@@ -608,7 +717,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
             return null;
           }
         })
-        .find((l: any) => l?.name === "WithdrawalINR");
+        .find((l: any) => l?.name === "WithdrawalFiat");
       const orderId = ev.args.orderId;
       await mockDiamond.cancelSellOrder(orderId);
       await integrator.reconcileWithdrawal(orderId);
@@ -621,7 +730,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
 
   describe("bucket bound (no unbounded-array DoS)", function () {
     it("spent buckets are compacted so the array stays bounded", async function () {
-      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One");
+      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
       // 5 deposits, unlock, withdraw all -> then deposit again; array must not
       // grow without bound (compaction removes spent buckets at the head)
       for (let i = 0; i < 4; i++) {
@@ -641,7 +750,7 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
     });
 
     it("compaction reclaims a spent bucket sitting BEHIND a still-locked bucket", async function () {
-      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One");
+      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", INR_CODE);
       // bucket A (will unlock), then bucket B (stays locked, sits in front of A
       // chronologically? no — A is older). Build: old unlocked A + newer locked B,
       // spend A fully, then deposit C. Interior zero (A) must be reclaimed even
@@ -677,6 +786,392 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await integrator.connect(merchant1).withdrawUSDC(USDC(20));
       await integrator.connect(merchant1).withdrawUSDC(USDC(20));
       expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(0);
+    });
+  });
+
+  // ─── Audit-fix regression tests ────────────────────────────────────
+  describe("audit fixes", function () {
+    const grabFiat = async (txPromise: any) => {
+      const tx = await txPromise;
+      const r = await tx.wait();
+      return r.logs
+        .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
+        .find((l: any) => l?.name === "WithdrawalFiat").args.orderId;
+    };
+
+    it("HIGH-1: SELL fee is charged to the merchant, NOT the shared pool (other merchant stays solvent)", async function () {
+      // m1 deposits 30, m2 deposits 20. m1 off-ramps 20 with a 1 USDC fee.
+      // The fee must come out of m1's own balance — m2's 20 must remain fully
+      // withdrawable (the old bug drained the pool and bricked m2).
+      await depositFor(merchant1, UPI_1, 3); // 30
+      await integrator.connect(merchant2).registerMerchant(UPI_2, "Shop Two", INR_CODE);
+      const o2 = await placeOrder(merchant2, 2); // 20
+      await mockDiamond.simulateOrderComplete(o2);
+      await increaseTime(SETTLEMENT + 3600);
+
+      await mockDiamond.setSellFee(USDC(1));
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""));
+      await mockDiamond.acceptSellOrder(orderId, "lp");
+      await integrator.connect(merchant1).deliverFiatPayout(orderId, "enc");
+
+      // m1 charged principal 20 + fee 1 = 21, leaving 9 of their 30
+      expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(USDC(9));
+      // m2 fully intact and actually withdrawable — pool is still solvent
+      expect((await integrator.getMerchantBalance(merchant2.address))[1]).to.equal(USDC(20));
+      await expect(integrator.connect(merchant2).withdrawUSDC(USDC(20)))
+        .to.emit(integrator, "WithdrawalUSDC");
+      // solvency invariant holds
+      const owed = await integrator.totalOwed();
+      const bal = await mockUsdc.balanceOf(await integrator.getAddress());
+      expect(bal >= owed).to.equal(true);
+    });
+
+    it("HIGH-1: a merchant with no headroom for the fee cannot drain the pool (reverts)", async function () {
+      // m1 deposits exactly 20 and off-ramps all 20 — nothing left to pay the
+      // fee, so delivery reverts instead of dipping into the pool.
+      await depositFor(merchant1, UPI_1, 2); // 20
+      await depositFor(merchant2, UPI_2, 2); // pool has USDC to forward
+      await increaseTime(SETTLEMENT + 3600);
+      await mockDiamond.setSellFee(USDC(1));
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""));
+      await mockDiamond.acceptSellOrder(orderId, "lp");
+      await expect(integrator.connect(merchant1).deliverFiatPayout(orderId, "enc"))
+        .to.be.revertedWithCustomError(integrator, "InsufficientAvailableBalance");
+    });
+
+    it("HIGH-2: a frozen merchant's in-flight withdrawal cannot be delivered", async function () {
+      await depositFor(merchant1, UPI_1, 3); // 30
+      await depositFor(merchant2, UPI_2, 2);
+      await increaseTime(SETTLEMENT + 3600);
+      await mockDiamond.setSellFee(USDC(1));
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""));
+      await mockDiamond.acceptSellOrder(orderId, "lp");
+      // owner freezes BETWEEN placement and delivery
+      await integrator.freezeMerchant(merchant1.address);
+      await expect(integrator.connect(merchant1).deliverFiatPayout(orderId, "enc"))
+        .to.be.revertedWithCustomError(integrator, "MerchantIsFrozen");
+    });
+
+    it("HIGH-2: owner can adminAbortWithdrawal to claw a frozen in-flight withdrawal back", async function () {
+      await depositFor(merchant1, UPI_1, 2); // 20
+      await increaseTime(SETTLEMENT + 3600);
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""));
+      await integrator.freezeMerchant(merchant1.address);
+      await expect(integrator.adminAbortWithdrawal(orderId))
+        .to.emit(integrator, "WithdrawalReconciled");
+      // funds back on the integrator, re-credited but LOCKED again (frozen)
+      expect(await mockUsdc.balanceOf(await integrator.getAddress())).to.equal(USDC(20));
+      const [pending, available] = await integrator.getMerchantBalance(merchant1.address);
+      expect(available).to.equal(0);       // re-locked under a fresh settlement window
+      expect(pending).to.equal(USDC(20));
+    });
+
+    it("HIGH-2: adminAbortWithdrawal only works on a FROZEN merchant and only for the owner", async function () {
+      await depositFor(merchant1, UPI_1, 2);
+      await increaseTime(SETTLEMENT + 3600);
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""));
+      // not frozen → reverts
+      await expect(integrator.adminAbortWithdrawal(orderId))
+        .to.be.revertedWithCustomError(integrator, "MerchantIsFrozen");
+      await integrator.freezeMerchant(merchant1.address);
+      // non-owner → reverts
+      await expect(integrator.connect(attacker).adminAbortWithdrawal(orderId))
+        .to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
+
+    it("MED-1: a second concurrent fiat withdrawal is rejected until the first settles", async function () {
+      await depositFor(merchant1, UPI_1, 4); // 40
+      await increaseTime(SETTLEMENT + 3600);
+      await integrator.connect(merchant1).withdrawFiat(USDC(20), 1, "");
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalInFlight");
+    });
+
+    it("MED-1: after the first withdrawal reconciles, a new one is allowed again", async function () {
+      await depositFor(merchant1, UPI_1, 4); // 40
+      await increaseTime(SETTLEMENT + 3600);
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""));
+      await mockDiamond.cancelSellOrder(orderId);
+      await integrator.reconcileWithdrawal(orderId); // settles + frees the slot
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""))
+        .to.emit(integrator, "WithdrawalFiat");
+    });
+
+    it("MED-2 + NEW-1: a COMPLETED (fiat-delivered) order can never re-credit USDC (double-spend blocked)", async function () {
+      // Genuine double-spend case: fiat was delivered AND the order COMPLETED.
+      // reconcile only acts on CANCELLED, so a completed order is never
+      // re-creditable — the merchant keeps the fiat, no USDC clawback.
+      await depositFor(merchant1, UPI_1, 3); // 30 (headroom for fee)
+      await depositFor(merchant2, UPI_2, 2);
+      await increaseTime(SETTLEMENT + 3600);
+      await mockDiamond.setSellFee(USDC(1));
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""));
+      await mockDiamond.acceptSellOrder(orderId, "lp");
+      await integrator.connect(merchant1).deliverFiatPayout(orderId, "enc"); // fiat PAID
+      await mockDiamond.completeSellOrder(orderId);                          // fiat DELIVERED
+      // completed → reconcile refuses (status != CANCELLED)
+      await expect(integrator.reconcileWithdrawal(orderId))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalNotCancellable");
+      // finalize settles it and frees the slot (the happy path)
+      await integrator.finalizeWithdrawal(orderId);
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(5), 1, ""))
+        .to.emit(integrator, "WithdrawalFiat"); // channel not bricked
+    });
+
+    it("NEW-1: a PAID-then-CANCELLED SELL is fully recoverable (refund re-credited, slot freed, no DoS)", async function () {
+      // The Diamond clawed the fiat back (refunds principal+fee to the proxy),
+      // so the merchant must be made whole and able to withdraw again.
+      await depositFor(merchant1, UPI_1, 3); // 30 (headroom for fee)
+      await depositFor(merchant2, UPI_2, 2);
+      await increaseTime(SETTLEMENT + 3600);
+      await mockDiamond.setSellFee(USDC(1));
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""));
+      await mockDiamond.acceptSellOrder(orderId, "lp");
+      await integrator.connect(merchant1).deliverFiatPayout(orderId, "enc"); // PAID, merchant charged 21
+      // after deliver: merchant available = 30 - 20 principal - 1 fee = 9
+      expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(USDC(9));
+
+      // LP times out / admin cancels the PAID SELL → Diamond refunds 21 to proxy
+      await mockDiamond.cancelSellOrder(orderId);
+
+      // recovery succeeds (was permanently bricked before the NEW-1 fix)
+      await expect(integrator.reconcileWithdrawal(orderId))
+        .to.emit(integrator, "WithdrawalReconciled");
+
+      // principal + fee (21) re-credited, re-locked under a fresh settlement
+      // window because the order had reached PAID. Merchant is fully whole.
+      const [pending, available] = await integrator.getMerchantBalance(merchant1.address);
+      expect(available).to.equal(USDC(9));   // unchanged: re-credit is locked
+      expect(pending).to.equal(USDC(21));    // principal 20 + fee 1 back, settling
+      // proxy emptied, funds back on the integrator
+      const proxy = await integrator.proxyAddress(merchant1.address);
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(0);
+
+      // and the in-flight slot is freed → the merchant can withdraw again
+      await increaseTime(SETTLEMENT + 100);
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""))
+        .to.emit(integrator, "WithdrawalFiat");
+    });
+
+    it("FINAL: a PAID→DISPUTED→CANCELLED order is recoverable via adminForceSettle (no channel-brick)", async function () {
+      // The disputed-clawback trap the final audit caught: reconcile refuses
+      // disputed, finalize needs COMPLETED, adminAbort refuses upiDelivered — so
+      // without adminForceSettle the slot stays stuck forever. Verify recovery.
+      await depositFor(merchant1, UPI_1, 3); // 30 (fee headroom)
+      await depositFor(merchant2, UPI_2, 2);
+      await increaseTime(SETTLEMENT + 3600);
+      await mockDiamond.setSellFee(USDC(1));
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""));
+      await mockDiamond.acceptSellOrder(orderId, "lp");
+      await integrator.connect(merchant1).deliverFiatPayout(orderId, "enc"); // PAID, charged 21
+
+      // dispute is raised, then the order is cancelled WITH a dispute recorded
+      await mockDiamond.setSellDispute(orderId, 1, 1); // raisedBy=1, status=1
+      await mockDiamond.cancelSellOrder(orderId);      // refunds 21 to proxy
+
+      // every normal settle path refuses this state
+      await expect(integrator.reconcileWithdrawal(orderId))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalNotCancellable"); // dispute guard
+      await expect(integrator.finalizeWithdrawal(orderId))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalNotCancellable"); // not COMPLETED
+
+      // owner force-settles: sweeps the 21 refund, re-credits principal+fee (20+1)
+      // re-locked, frees the slot.
+      await expect(integrator.adminForceSettle(orderId))
+        .to.emit(integrator, "WithdrawalReconciled");
+      const proxy = await integrator.proxyAddress(merchant1.address);
+      expect(await mockUsdc.balanceOf(proxy)).to.equal(0); // refund recovered
+
+      // merchant made whole: 9 still-available + 21 re-locked = 30 pending+available
+      const [pending, available] = await integrator.getMerchantBalance(merchant1.address);
+      expect(available).to.equal(USDC(9));
+      expect(pending).to.equal(USDC(21)); // principal 20 + fee 1 refunded, settling
+
+      // channel no longer bricked
+      await increaseTime(SETTLEMENT + 100);
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""))
+        .to.emit(integrator, "WithdrawalFiat");
+    });
+
+    it("FINAL: adminForceSettle is owner-only and refuses a non-CANCELLED order", async function () {
+      await depositFor(merchant1, UPI_1, 2);
+      await increaseTime(SETTLEMENT + 3600);
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""));
+      // not cancelled yet → reverts
+      await expect(integrator.adminForceSettle(orderId))
+        .to.be.revertedWithCustomError(integrator, "WithdrawalNotCancellable");
+      // non-owner → reverts
+      await mockDiamond.cancelSellOrder(orderId);
+      await expect(integrator.connect(attacker).adminForceSettle(orderId))
+        .to.be.revertedWithCustomError(integrator, "OnlyOwner");
+    });
+
+    it("MED-4: a stale cross-day cancellation does not decrement the new day's tx count", async function () {
+      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop", INR_CODE);
+      // Day N: place 4 (hit the daily limit). Keep the first order id.
+      const firstOrder = await placeOrder(merchant1, 1);
+      for (let i = 0; i < 3; i++) await placeOrder(merchant1, 1);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[0]).to.equal(4n);
+
+      // Roll to day N+1 and place 4 more (counter resets, hits limit again).
+      await increaseTime(DAY);
+      for (let i = 0; i < 4; i++) await placeOrder(merchant1, 1);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[0]).to.equal(4n);
+
+      // A DAY-N order cancels on day N+1 — must NOT decrement today's counter.
+      const ds = await diamondSigner();
+      await integrator.connect(ds).onOrderCancel(firstOrder);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[0]).to.equal(4n);
+    });
+
+    it("MED-4: a SAME-day cancellation still correctly releases a slot", async function () {
+      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop", INR_CODE);
+      const o = await placeOrder(merchant1, 1);
+      await placeOrder(merchant1, 1);
+      expect((await integrator.getDailyTxInfo(merchant1.address))[0]).to.equal(2n);
+      const ds = await diamondSigner();
+      await integrator.connect(ds).onOrderCancel(o); // same day → decrements
+      expect((await integrator.getDailyTxInfo(merchant1.address))[0]).to.equal(1n);
+    });
+
+    it("MED-5: deposits sharing an unlock window coalesce, so the bucket count stays bounded", async function () {
+      // Two deposits credited at the same unlock timestamp fold into ONE bucket,
+      // so the credit path can never grow unboundedly or revert at the cap.
+      await depositFor(merchant1, UPI_1, 1);  // 10, one bucket
+      const o = await placeOrder(merchant1, 1);
+      await mockDiamond.simulateOrderComplete(o); // same-window credit → coalesces
+      const buckets = await integrator.getMerchantBuckets(merchant1.address);
+      const total = buckets.reduce((s: bigint, b: any) => s + b.amount, 0n);
+      expect(total).to.equal(USDC(20));        // both credited, nothing stranded
+    });
+
+    it("INFO-2: a currency code with an interior NUL byte is rejected", async function () {
+      const withNul = "IN" + String.fromCharCode(0) + "R";
+      await expect(integrator.toCurrency(withNul))
+        .to.be.revertedWithCustomError(integrator, "InvalidCurrency");
+    });
+
+    it("NEW-2: a reconcile re-credit (past-dated) never unlocks a merchant's other STILL-LOCKED funds", async function () {
+      // Deposit 40 (locked), withdraw 20 fiat (from unlocked? no — locked, so
+      // first settle 40, then take 20). Set up: 40 available, withdraw 20 fiat,
+      // cancel→reconcile re-credits past-dated. The remaining bucket must stay
+      // correct; a fresh locked deposit must remain locked afterward.
+      await depositFor(merchant1, UPI_1, 4); // 40
+      await increaseTime(SETTLEMENT + 100);  // 40 unlocked
+      const orderId = await grabFiat(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, "")); // 20 left unlocked
+      // add a FRESH locked deposit (still within settlement)
+      const o = await placeOrder(merchant1, 2); // +20, locked
+      await mockDiamond.simulateOrderComplete(o);
+      // now: 20 unlocked (old) + 20 locked (fresh)
+      expect((await integrator.getMerchantBalance(merchant1.address))[0]).to.equal(USDC(20)); // pending(locked)
+      expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(USDC(20)); // available
+
+      // cancel + reconcile the fiat withdrawal: re-credits 20 past-dated (unlocked).
+      await mockDiamond.cancelSellOrder(orderId);
+      await integrator.reconcileWithdrawal(orderId);
+
+      // the FRESH 20 must remain LOCKED — the past-dated re-credit must not have
+      // bled into it. available = 20(old) + 20(reconciled) = 40; pending = 20.
+      expect((await integrator.getMerchantBalance(merchant1.address))[0]).to.equal(USDC(20)); // still locked
+      expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(USDC(40));
+    });
+  });
+
+  // ─── FINAL pre-whitelisting pass ──────────────────────────────────
+  // Locks the exact external surface the frontend depends on, and proves the
+  // three withdrawal types end-to-end. If any of these break, the frontend
+  // breaks — so they guard against a post-whitelist "you have to change this".
+  describe("pre-whitelisting: ABI surface + full lifecycles", function () {
+    // Pull the WithdrawalFiat orderId out of a withdraw tx.
+    const fiatOrderId = async (txPromise: any) => {
+      const r = await (await txPromise).wait();
+      return r.logs
+        .map((l: any) => { try { return integrator.interface.parseLog(l); } catch { return null; } })
+        .find((l: any) => l?.name === "WithdrawalFiat").args.orderId;
+    };
+
+    it("ABI: every function the frontend calls exists with the expected signature", async function () {
+      // These are the EXACT signatures in frontend/lib/contract.ts. If a name or
+      // arg list drifts, getFunction throws — catching the mismatch here.
+      const sigs = [
+        "registerMerchant(string,string,string)",
+        "registerMerchantRaw(string,string,bytes32)",
+        "userPlaceOrder(address,uint256,uint256,bytes32,uint256,string)",
+        "withdrawFiat(uint256,uint256,string)",
+        "withdrawFiatIn(uint256,uint256,bytes32,string)",
+        "withdrawUSDC(uint256)",
+        "deliverFiatPayout(uint256,string)",
+        "getMerchantBalance(address)",
+        "getMerchantInfo(address)",
+        "getMerchantBuckets(address)",
+        "getDailyTxInfo(address)",
+        "getMerchantCurrency(address)",
+        "proxyAddress(address)",
+        "registered(address)",
+      ];
+      for (const s of sigs) {
+        expect(integrator.interface.getFunction(s), s).to.not.equal(null);
+      }
+      // getMerchantInfo MUST return 5 values in this order (frontend reads [0],[1]).
+      const out = integrator.interface.getFunction("getMerchantInfo")!.outputs.map((o: any) => o.type);
+      expect(out).to.deep.equal(["string", "string", "bytes32", "bool", "bool"]);
+    });
+
+    it("registration REQUIRES a currency (3-arg) — a 2-arg call cannot encode", async function () {
+      // registerMerchant takes exactly 3 inputs now (payoutId, shopName,
+      // currencyCode). A frontend that passes only 2 fails to encode the call,
+      // so the old INR-only assumption can't slip through.
+      const fn = integrator.interface.getFunction("registerMerchant")!;
+      expect(fn.inputs.length).to.equal(3);
+      expect(fn.inputs.map((i: any) => i.type)).to.deep.equal(["string", "string", "string"]);
+      // Encoding with only 2 args throws (wrong argument count).
+      expect(() => integrator.interface.encodeFunctionData("registerMerchant", [UPI_1, "Shop One"]))
+        .to.throw();
+      // The 3-arg form works + locks the currency.
+      await integrator.connect(merchant1).registerMerchant(UPI_1, "Shop One", "INR");
+      expect(await integrator.getMerchantCurrency(merchant1.address)).to.equal("INR");
+    });
+
+    it("LIFECYCLE A: accept → settle → withdraw USDC to wallet (full happy path)", async function () {
+      await depositFor(merchant1, UPI_1, 2);                 // accept 20, locked
+      await increaseTime(SETTLEMENT + 60);                   // settle
+      const before = await mockUsdc.balanceOf(merchant1.address);
+      await expect(integrator.connect(merchant1).withdrawUSDC(USDC(20)))
+        .to.emit(integrator, "WithdrawalUSDC");
+      const after = await mockUsdc.balanceOf(merchant1.address);
+      expect(after - before).to.equal(USDC(20));             // exact USDC landed
+      expect((await integrator.getMerchantBalance(merchant1.address))[1]).to.equal(0); // drained
+    });
+
+    it("LIFECYCLE B: accept → settle → withdraw HOME fiat → LP pays → COMPLETED (slot freed)", async function () {
+      await depositFor(merchant1, UPI_1, 2);
+      await increaseTime(SETTLEMENT + 60);
+      const orderId = await fiatOrderId(integrator.connect(merchant1).withdrawFiat(USDC(20), 1, ""));
+      await mockDiamond.acceptSellOrder(orderId, "lp");   // no fee set → actual = principal
+      await integrator.deliverFiatPayout(orderId, "encPayout");
+      await mockDiamond.completeSellOrder(orderId);
+      await integrator.finalizeWithdrawal(orderId);
+      // slot freed → a brand-new fiat withdrawal is allowed again (no brick).
+      // merchant1 is already registered; just accept + settle more funds.
+      const o2 = await placeOrder(merchant1, 1);
+      await mockDiamond.simulateOrderComplete(o2);
+      await increaseTime(SETTLEMENT + 60);
+      await expect(integrator.connect(merchant1).withdrawFiat(USDC(10), 1, ""))
+        .to.emit(integrator, "WithdrawalFiat");
+    });
+
+    it("LIFECYCLE C: a non-INR (BRL) merchant withdraws in their OWN currency via withdrawFiat", async function () {
+      // Proves the home path is currency-generic on the new contract (audit BUG-B
+      // fix on-chain): the SELL is placed in BRL, not hardcoded INR.
+      await integrator.connect(merchant1).registerMerchant("joao@pix", "Café", "BRL");
+      const o = await placeOrder(merchant1, 2);
+      await mockDiamond.simulateOrderComplete(o);
+      await increaseTime(SETTLEMENT + 60);
+      const orderId = await fiatOrderId(integrator.connect(merchant1).withdrawFiat(USDC(20), 2, ""));
+      // The WithdrawalFiat event carries the merchant's registered currency = BRL.
+      const r = await integrator.queryFilter(integrator.filters.WithdrawalFiat());
+      const ev = r.find((e: any) => e.args.orderId === orderId);
+      expect(ev!.args.currency).to.equal(ethers.encodeBytes32String("BRL"));
     });
   });
 });

@@ -68,3 +68,35 @@ export async function fetchUsdcInrRate() {
   } catch {}
   return { rate: 90, source: "offline estimate", at: Date.now() };
 }
+
+// Per-currency USDC rate via CoinGecko (USDC ≈ 1 USD, so vs_currencies works).
+// India keeps the p2p live rate (the real protocol price); others use market.
+async function marketRate(vs) {
+  try {
+    const r = await fetch(
+      `https://api.coingecko.com/api/v3/simple/price?ids=usd-coin&vs_currencies=${vs.toLowerCase()}`,
+      { cache: "no-store" }
+    );
+    const j = await r.json();
+    const rate = j["usd-coin"]?.[vs.toLowerCase()];
+    return rate && rate > 0 ? rate : null;
+  } catch {
+    return null;
+  }
+}
+
+// Sensible offline fallbacks so the UI never shows a broken rate.
+const FALLBACK = { INR: 90, BRL: 5.4, ARS: 1000 };
+
+/**
+ * Country-aware USDC→local rate. For India, prefer the p2p live rate (the price
+ * merchants actually get on-chain); for others, market rate, then fallback.
+ * Returns { rate, source }.
+ */
+export async function fetchUsdcRate(country) {
+  const code = country?.code || "INR";
+  if (code === "INR") return fetchUsdcInrRate();
+  const m = await marketRate(code);
+  if (m) return { rate: m, source: "market rate", at: Date.now() };
+  return { rate: FALLBACK[code] || 1, source: "offline estimate", at: Date.now() };
+}

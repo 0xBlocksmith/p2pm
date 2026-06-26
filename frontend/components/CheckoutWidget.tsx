@@ -20,7 +20,19 @@ import { ACTIVE_CHAIN } from "../lib/chain";
  *   onComplete  (orderId) => void
  *   onClose     () => void
  */
-export function CheckoutWidget({ usdcAmount, quantity, productName, onPlaced, onComplete, onCancel, onClose }) {
+type CheckoutWidgetProps = {
+  usdcAmount: bigint;
+  quantity: bigint;
+  productName?: string;
+  currencies?: any[];
+  onPlaced?: (orderId: any, txHash?: any) => void;
+  onComplete?: (orderId: any) => void;
+  onCancel?: (orderId?: any) => void;
+  onClose?: () => void;
+  onError?: (msg: string) => void;
+};
+
+export function CheckoutWidget({ usdcAmount, quantity, productName, currencies, onPlaced, onComplete, onCancel, onClose, onError }: CheckoutWidgetProps) {
   const { signer, publicClient, ready } = useCheckoutSigner();
   const { getIdentity } = useRelayIdentity();
   const [err, setErr] = useState("");
@@ -39,18 +51,18 @@ export function CheckoutWidget({ usdcAmount, quantity, productName, onPlaced, on
         open={true}
         signer={signer}
         chainId={ACTIVE_CHAIN.id}
-        diamondAddress={DIAMOND_ADDRESS || undefined}
-        currencies={CURRENCIES}
+        diamondAddress={(DIAMOND_ADDRESS || undefined) as `0x${string}` | undefined}
+        currencies={currencies && currencies.length ? currencies : CURRENCIES}
         productName={productName}
         amount={`${(Number(usdcAmount) / 1e6).toFixed(2)} USDC`}
         subgraphUrl={SUBGRAPH_URL}
-        usdcAddress={USDC_ADDRESS || undefined}
+        usdcAddress={(USDC_ADDRESS || undefined) as `0x${string}` | undefined}
         usdcAmount={usdcAmount}
         placeOrder={placeOrder}
         onOrderPlaced={(orderId, txHash) => onPlaced?.(orderId, txHash)}
         onComplete={(orderId) => onComplete?.(orderId)}
         onCancel={(orderId) => onCancel?.(orderId)}
-        onError={(e) => setErr(e?.message || String(e))}
+        onError={(e) => { const m = e?.message || String(e); setErr(m); onError?.(m); }}
         onClose={() => onClose?.()}
       />
     </>

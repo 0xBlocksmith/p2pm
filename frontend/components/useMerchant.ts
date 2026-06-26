@@ -6,6 +6,7 @@ import { usePrivy } from "@privy-io/react-auth";
 import { useReadContract } from "wagmi";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI } from "../lib/contract";
 import { useSmartAccount } from "./useSmartAccount";
+import { prefsSet } from "../lib/countries";
 
 /**
  * Shared page guard: requires Privy auth + on-chain registration.
@@ -31,13 +32,15 @@ export function useMerchant({ requireRegistered = true } = {}) {
     if (privyReady && !authenticated) router.replace("/login");
   }, [privyReady, authenticated, router]);
 
-  // Onboarding awaits the on-chain registration before routing here, so
-  // `registered` is already true — a simple guard, no off-chain flag needed.
+  // Currency + language are chosen on the login page. If somehow missing
+  // (e.g. direct deep-link), bounce back to login. Registration is NOT forced —
+  // the dashboard opens for unregistered users; registration is requested
+  // lazily when they tap "Accept Payment".
   useEffect(() => {
-    if (requireRegistered && address && !regLoading && isRegistered === false) {
-      router.replace("/onboarding");
+    if (requireRegistered && privyReady && authenticated && !prefsSet()) {
+      router.replace("/login");
     }
-  }, [requireRegistered, address, regLoading, isRegistered, router]);
+  }, [requireRegistered, privyReady, authenticated, router]);
 
   return {
     ready: saReady && !regLoading,

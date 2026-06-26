@@ -56,9 +56,11 @@ export function AccountMenu() {
             <div className="avatar lg">{initial}</div>
             <div className="acct-id">
               {email && <div className="acct-email">{email}</div>}
-              <button className="acct-addr" onClick={copy} title="Copy address">
-                {address ? `${address.slice(0, 6)}…${address.slice(-4)}` : "…"}
-                <span className="muted" style={{ marginLeft: 6 }}>{copied ? "copied ✓" : "⧉"}</span>
+              <button className="acct-addr" onClick={copy} title="Copy address" disabled={!address}>
+                {address ? `${address.slice(0, 6)}…${address.slice(-4)}` : "connecting…"}
+                {address && (
+                  <span className="muted" style={{ marginLeft: 6 }}>{copied ? "copied ✓" : "⧉"}</span>
+                )}
               </button>
             </div>
           </div>
@@ -74,10 +76,7 @@ export function AccountMenu() {
             </div>
           </div>
 
-          <p className="muted" style={{ fontSize: 11, padding: "0 4px" }}>
-            <span className="dot" style={{ marginLeft: 0, marginRight: 6 }} />
-            Gas-sponsored smart wallet — no ETH needed.
-          </p>
+          <a className="acct-menu-link" href="/settings">Settings</a>
 
           <button className="btn secondary small" style={{ width: "100%" }} onClick={logout}>
             Log out

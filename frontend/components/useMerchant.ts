@@ -2,22 +2,22 @@
 
 import { useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { usePrivy } from "@privy-io/react-auth";
 import { useReadContract } from "wagmi";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI } from "../lib/contract";
 import { useSmartAccount } from "./useSmartAccount";
+import { useAuth } from "./useAuth";
 import { prefsSet } from "../lib/countries";
 
 /**
- * Shared page guard: requires Privy auth + on-chain registration.
- * Redirects to /login when logged out, /onboarding when unregistered.
+ * Shared page guard: requires wallet auth (thirdweb) + prefs.
+ * Redirects to /login when logged out or when prefs are missing.
  *
- * The merchant's on-chain identity is their Privy SMART WALLET (gas sponsored),
- * NOT the embedded EOA — so `address` here is the smart wallet address.
+ * The merchant's on-chain identity is their thirdweb SMART ACCOUNT (gas
+ * sponsored) — so `address` here is the smart-account address.
  */
 export function useMerchant({ requireRegistered = true } = {}) {
   const router = useRouter();
-  const { ready: privyReady, authenticated } = usePrivy();
+  const { ready: authReady, authenticated } = useAuth();
   const { address, ready: saReady, sendTransaction } = useSmartAccount();
 
   const { data: isRegistered, isLoading: regLoading, refetch } = useReadContract({
@@ -29,21 +29,28 @@ export function useMerchant({ requireRegistered = true } = {}) {
   });
 
   useEffect(() => {
-    if (privyReady && !authenticated) router.replace("/login");
-  }, [privyReady, authenticated, router]);
+    if (authReady && !authenticated) router.replace("/login");
+  }, [authReady, authenticated, router]);
 
   // Currency + language are chosen on the login page. If somehow missing
   // (e.g. direct deep-link), bounce back to login. Registration is NOT forced —
   // the dashboard opens for unregistered users; registration is requested
   // lazily when they tap "Accept Payment".
   useEffect(() => {
-    if (requireRegistered && privyReady && authenticated && !prefsSet()) {
+    if (requireRegistered && authReady && authenticated && !prefsSet()) {
       router.replace("/login");
     }
-  }, [requireRegistered, privyReady, authenticated, router]);
+  }, [requireRegistered, authReady, authenticated, router]);
+
+  // `ready` means "safe to act on address + isRegistered". During thirdweb's
+  // multi-second smart-account init the address is briefly undefined; treating
+  // that as ready would let pages route on a stale/undefined isRegistered and
+  // flicker. So require the smart account AND (once we have an address) that the
+  // registration read has actually resolved.
+  const ready = authReady && (!authenticated || (saReady && !!address && !regLoading));
 
   return {
-    ready: saReady && !regLoading,
+    ready,
     authenticated,
     address,
     isRegistered,

@@ -9,6 +9,8 @@ const config: HardhatUserConfig = {
   networks: {
     baseSepolia: {
       url: process.env.BASE_SEPOLIA_RPC || "https://sepolia.base.org",
+      // Pinned so a mistyped RPC URL can never silently deploy to another chain.
+      chainId: 84532,
       accounts: process.env.DEPLOYER_PRIVATE_KEY
         ? [process.env.DEPLOYER_PRIVATE_KEY]
         : process.env.MNEMONIC_KEY
@@ -17,6 +19,7 @@ const config: HardhatUserConfig = {
     },
     base: {
       url: process.env.BASE_RPC || "https://mainnet.base.org",
+      chainId: 8453,
       accounts: process.env.DEPLOYER_PRIVATE_KEY
         ? [process.env.DEPLOYER_PRIVATE_KEY]
         : process.env.MNEMONIC_KEY

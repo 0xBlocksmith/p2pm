@@ -17,7 +17,7 @@ import { loadCountry, prefsSet } from "../../lib/countries";
  */
 export default function Onboarding() {
   const router = useRouter();
-  const { ready, address, isRegistered, sendTransaction } = useMerchant({
+  const { ready, address, isRegistered, sendTransaction, refetchRegistered } = useMerchant({
     requireRegistered: false,
   });
   const publicClient = usePublicClient();
@@ -75,13 +75,21 @@ export default function Onboarding() {
       });
       const hash = await send({ to: CONTRACT_ADDRESS, data });
 
-      // Don't hang forever waiting for the receipt — confirm via the on-chain
-      // `registered` read instead, which the page already refetches.
+      // Confirm the receipt; surface an on-chain revert instead of silently
+      // routing on to /qr (which would bounce back here as still-unregistered).
       try {
-        await publicClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
+        const receipt = await publicClient.waitForTransactionReceipt({ hash, timeout: 60_000 });
+        if (receipt?.status === "reverted") {
+          setBusy(false);
+          return setError("Registration failed on-chain. Please try again.");
+        }
       } catch {
-        // Receipt slow? Fall through — the registered flag below confirms it.
+        // Receipt slow? Fall through — the refetched `registered` flag confirms it.
       }
+      // Refresh the cached `registered` read BEFORE navigating. /qr reads the same
+      // wagmi query key; without this it sees the stale `false` and bounces the
+      // merchant back to onboarding → dashboard instead of the terminal.
+      try { await refetchRegistered?.(); } catch {}
       // They came here from "Accept Payment" — continue to the terminal.
       router.replace("/qr");
     } catch (err) {

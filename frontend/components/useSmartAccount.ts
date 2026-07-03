@@ -1,59 +1,58 @@
 "use client";
 
 import { useMemo } from "react";
-import { usePrivy } from "@privy-io/react-auth";
-import { useSmartWallets } from "@privy-io/react-auth/smart-wallets";
+import { useActiveAccount, useActiveWalletConnectionStatus } from "thirdweb/react";
+import { prepareTransaction, sendTransaction as twSendTransaction } from "thirdweb";
+import { thirdwebClient, THIRDWEB_CHAIN } from "../lib/thirdweb";
 
 /**
- * The merchant's identity is their Privy SMART WALLET (Kernel ERC-4337), not
- * the embedded EOA. Gas is sponsored by the Pimlico paymaster configured in the
- * Privy dashboard, so the merchant transacts with 0 ETH.
+ * The merchant's identity is their thirdweb SMART ACCOUNT (ERC-4337), created
+ * from an in-app wallet (email/social) with gas SPONSORED by the thirdweb
+ * paymaster — so the merchant transacts with 0 ETH. (This replaces the old Privy
+ * smart wallet + Pimlico paymaster; the rest of the app is unchanged because the
+ * returned shape is identical.)
  *
- * Returns:
- *   address          smart wallet address (the on-chain merchant identity)
- *   ready            true once Privy is ready, authenticated, and the smart
- *                    wallet + client exist
+ * Returns (SAME shape the app already consumes):
+ *   address          smart-account address (the on-chain merchant identity)
+ *   ready            true once a smart account is connected and usable
  *   sendTransaction  ({ to, data, value? }) => `0x${hash}` — a sponsored tx
- *                    (UserOperation) sent through the smart wallet
  *
- * `sendTransaction` returns the tx hash string directly (matches what callers
- * pass to publicClient.waitForTransactionReceipt({ hash })).
+ * `useActiveAccount()` returns the SMART account (not the underlying admin EOA)
+ * because the wallet configured in providers.tsx wraps the in-app wallet in a
+ * smartAccount({ sponsorGas: true }). So `account.address` IS the smart-account
+ * address that gets registered on-chain.
  */
 export function useSmartAccount() {
-  const { ready: privyReady, authenticated, user } = usePrivy();
-  const { client } = useSmartWallets();
+  const account = useActiveAccount();
+  const status = useActiveWalletConnectionStatus();
 
-  // Resolve the smart-wallet address from every place Privy may expose it, so
-  // the UI shows it as soon as it exists (client, linkedAccounts, or the
-  // top-level user.smartWallet shortcut). Smart-wallet only — never the EOA.
-  const linkedSmart: any = user?.linkedAccounts?.find((a: any) => a.type === "smart_wallet");
-  const address: `0x${string}` | undefined =
-    client?.account?.address ||
-    linkedSmart?.address ||
-    (user as any)?.smartWallet?.address ||
-    undefined;
-
-  const ready = !!(privyReady && authenticated && client && address);
+  const address = account?.address as `0x${string}` | undefined;
+  const ready = status === "connected" && !!account && !!address;
 
   const sendTransaction = useMemo(() => {
-    if (!client) return null;
-    return async ({ to, data, value }: { to: `0x${string}`; data: `0x${string}`; value?: bigint | number }) => {
-      // Privy's smart-wallet client routes this through the bundler + paymaster.
-      // showWalletUIs:false suppresses the per-tx confirmation modal — gas is
-      // sponsored, so no approval is needed. Because the p2p widget's pay/cancel
-      // txs also flow through this signer, this covers the whole flow (place →
-      // pay → cancel) with zero popups.
-      const hash = await client.sendTransaction(
-        {
-          to,
-          data,
-          ...(value ? { value: BigInt(value) } : {}),
-        } as any,
-        { uiOptions: { showWalletUIs: false } }
-      );
-      return hash;
+    if (!account) return null;
+    return async ({
+      to,
+      data,
+      value,
+    }: {
+      to: `0x${string}`;
+      data: `0x${string}`;
+      value?: bigint | number;
+    }): Promise<`0x${string}`> => {
+      // Build a raw transaction and send it through the smart account. thirdweb
+      // routes it as a sponsored UserOperation (gas paid by the paymaster).
+      const tx = prepareTransaction({
+        client: thirdwebClient,
+        chain: THIRDWEB_CHAIN,
+        to,
+        data,
+        ...(value ? { value: BigInt(value) } : {}),
+      });
+      const { transactionHash } = await twSendTransaction({ account, transaction: tx });
+      return transactionHash as `0x${string}`;
     };
-  }, [client]);
+  }, [account]);
 
-  return { address, ready, sendTransaction, client };
+  return { address, ready, sendTransaction, account };
 }

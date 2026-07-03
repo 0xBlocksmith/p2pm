@@ -34,10 +34,11 @@ export default function RootLayout({ children }) {
     <html lang="en" className={jakarta.variable} suppressHydrationWarning>
       <head>
         {/* Preload the splash logo so it paints with zero fetch gap, and warm
-            the Privy/Alchemy connections so auth init starts sooner. */}
+            the thirdweb/Alchemy connections so wallet init starts sooner. */}
         <link rel="preload" as="image" href="/logo-mark.png" />
-        <link rel="preconnect" href="https://auth.privy.io" crossOrigin="" />
-        <link rel="dns-prefetch" href="https://auth.privy.io" />
+        <link rel="preconnect" href="https://c.thirdweb.com" crossOrigin="" />
+        <link rel="dns-prefetch" href="https://c.thirdweb.com" />
+        <link rel="preconnect" href="https://embedded-wallet.thirdweb.com" crossOrigin="" />
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
         {/* Register the service worker so the app is installable (PWA). */}
         <script

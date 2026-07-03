@@ -121,12 +121,16 @@ export async function fetchWithdrawals(proxyAddress) {
  *   { orderId, amount(raw 6-dec), status, txHash, placedAt, completedAt }
  */
 export async function fetchOrder(orderId) {
-  if (orderId == null || orderId === "") return null;
+  // On-chain order ids are integers — reject anything else so a crafted id can't
+  // reach the query as arbitrary text (defense-in-depth for the public receipt).
+  const id = String(orderId ?? "").trim();
+  if (!/^\d+$/.test(id)) return null;
   const query = `{
-    orders_collection(first: 1, where: { orderId: "${String(orderId)}" }) {
+    orders_collection(first: 1, where: { orderId: "${id}" }) {
       orderId
       status
       usdcAmount
+      userAddress
       placedAt
       completedAt
       transactionHash
@@ -150,6 +154,7 @@ export async function fetchOrder(orderId) {
     orderId: String(o.orderId),
     amount: String(o.usdcAmount),
     status: ST[Number(o.status)] || "matching",
+    userAddress: o.userAddress || null,   // the placer proxy (resolves to the merchant)
     txHash: o.transactionHash || null,
     placedAt: Number(o.placedAt),
     completedAt: o.completedAt ? Number(o.completedAt) : null,

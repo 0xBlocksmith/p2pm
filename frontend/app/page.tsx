@@ -2,7 +2,7 @@
 
 import { useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { usePrivy } from "@privy-io/react-auth";
+import { useAuth } from "../components/useAuth";
 import { prefsSet } from "../lib/countries";
 import { Splash } from "../components/Splash";
 
@@ -17,14 +17,14 @@ import { Splash } from "../components/Splash";
  */
 export default function Home() {
   const router = useRouter();
-  const { ready: privyReady, authenticated } = usePrivy();
+  const { ready, authenticated } = useAuth();
 
   useEffect(() => {
-    if (!privyReady) return;
+    if (!ready) return;
     if (!authenticated) { router.replace("/login"); return; }
     if (!prefsSet()) { router.replace("/login"); return; }
     router.replace("/dashboard");
-  }, [privyReady, authenticated, router]);
+  }, [ready, authenticated, router]);
 
   return <Splash />;
 }

@@ -4,14 +4,15 @@ import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useReadContract } from "wagmi";
-import { useFundWallet, usePrivy } from "@privy-io/react-auth";
 import { QRCodeSVG } from "qrcode.react";
 import { encodeFunctionData, parseUnits } from "viem";
 import { Icon } from "./Icons";
 import { useT } from "../lib/i18n";
 import { useSmartAccount } from "./useSmartAccount";
+import { useAuth } from "./useAuth";
 import { CONTRACT_ADDRESS, fmtUsdc } from "../lib/contract";
-import { fmtFiat } from "../lib/countries";
+import { fmtFiat, clearLocalUserData } from "../lib/countries";
+import { ACTIVE_CHAIN } from "../lib/chain";
 
 const SCAN = "https://sepolia.basescan.org";
 const USDC = (process.env.NEXT_PUBLIC_USDC_ADDRESS || "") as `0x${string}`;
@@ -44,10 +45,10 @@ const BAL_ABI = [{
 
 /**
  * Full wallet bottom-sheet (slides up from the dashboard Wallet tile). A real
- * crypto-wallet UI built on Privy's building blocks:
- *   • Receive — the smart-wallet address + a scannable QR (we render it)
- *   • Send    — a form → routed through the smart wallet (gasless)
- *   • Buy     — Privy's on-ramp modal (useFundWallet) to buy USDC with a card
+ * crypto-wallet UI on the thirdweb smart account:
+ *   • Receive — the smart-account address + a scannable QR (we render it)
+ *   • Send    — a form → routed through the smart account (gasless)
+ *   • Buy     — opens thirdweb Pay (fiat→USDC) to fund the account with a card
  * Plus the merchant's on-chain profile (shop, payout, currency) and balance.
  */
 export function WalletSheet({
@@ -58,8 +59,7 @@ export function WalletSheet({
   const { t } = useT();
   const router = useRouter();
   const { sendTransaction } = useSmartAccount();
-  const { fundWallet } = useFundWallet();
-  const { logout } = usePrivy();
+  const { logout } = useAuth();
   const [tab, setTab] = useState<"home" | "receive" | "send">("home");
   const [copied, setCopied] = useState(false);
   const [to, setTo] = useState("");
@@ -91,8 +91,16 @@ export function WalletSheet({
 
   function buy() {
     if (!address) return;
-    // Privy on-ramp (enable Coinbase/MoonPay in the Privy dashboard → Funding).
-    fundWallet(address).catch(() => {});
+    // On-ramp: point at thirdweb Pay (fiat→USDC) prefilled to fund THIS smart
+    // account on the active chain. Opens in a new tab; the team can later swap
+    // this for an in-app <PayEmbed> if they want a fully embedded flow.
+    const chainId = ACTIVE_CHAIN.id;
+    const url =
+      `https://thirdweb.com/pay` +
+      `?chainId=${chainId}` +
+      (USDC ? `&tokenAddress=${USDC}` : "") +
+      `&recipientAddress=${address}`;
+    window.open(url, "_blank", "noopener,noreferrer");
   }
 
   async function send() {
@@ -123,7 +131,7 @@ export function WalletSheet({
       <div className="sheet" onClick={(e) => e.stopPropagation()}>
         <div className="sheet-grip" />
 
-        {/* header — avatar + address + "Smart Account" (Privy-wallet style) */}
+        {/* header — avatar + address + "Smart Account" (wallet-app style) */}
         <div className="wsheet-head">
           <div className="wsheet-avatar">{(shopName || "M").slice(0, 1).toUpperCase()}</div>
           <div className="wsheet-id">
@@ -184,7 +192,7 @@ export function WalletSheet({
                 <span className="wmenu-ico"><Icon.Gear width="18" height="18" /></span>
                 <span>{t("wallet.manage")}</span><span className="wmenu-car">›</span>
               </button>
-              <button className="wmenu-row danger" onClick={() => { onClose(); logout().then(() => router.replace("/login")); }}>
+              <button className="wmenu-row danger" onClick={() => { onClose(); clearLocalUserData(); logout().finally(() => router.replace("/login")); }}>
                 <span className="wmenu-ico"><Icon.Back width="18" height="18" /></span>
                 <span>{t("wallet.disconnect")}</span>
               </button>

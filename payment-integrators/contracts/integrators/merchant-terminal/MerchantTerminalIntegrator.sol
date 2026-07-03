@@ -30,9 +30,12 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
  *
  *         SELL flow (fiat withdrawal): the merchant's own proxy places the sell
  *         order; this contract funds that proxy with the USDC at placement and
- *         passes the merchant's saved payout id as userPubKey, in the merchant's
- *         own currency. If a sell order is cancelled on the Diamond, the USDC is
- *         refunded to the proxy; `reconcileWithdrawal` sweeps it back and
+ *         passes the merchant's RELAY PUBKEY (secp256k1, the same identity used
+ *         for BUY) as userPubKey, in the merchant's own currency. The actual
+ *         payout handle (UPI/PIX) is NOT placed on-chain here — it is delivered
+ *         later, encrypted to that pubkey, via `deliverFiatPayout` →
+ *         `setSellOrderUpi`. If a sell order is cancelled on the Diamond, the
+ *         USDC is refunded to the proxy; `reconcileWithdrawal` sweeps it back and
  *         re-credits the merchant so no funds are stranded.
  *
  *         Limits enforced in validateOrder: 50 USDC per transaction and 4
@@ -45,6 +48,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     // ─── Errors ───────────────────────────────────────────────────────
     error OnlyDiamond();
     error OnlyOwner();
+    /// @dev Raised when the caller's role tier is below what an action requires.
+    ///      Carries (required, actual) tier values so the admin panel can show
+    ///      exactly which role is needed. required/actual are the Role enum uint8.
+    error NotAuthorized(uint8 required, uint8 actual);
     error InvalidAddress();
     error AlreadyRegistered();
     error NotRegistered();
@@ -75,6 +82,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     event OrderPlaced(uint256 indexed orderId, address indexed user, uint256 amount);
     event UserProxyDeployed(address indexed user, address proxy);
     event MerchantRegistered(address indexed merchant, string payoutId, string shopName, bytes32 currency);
+    event MerchantProfileUpdated(address indexed merchant, string payoutId, string shopName);
     event OrderCompleted(
         uint256 indexed orderId,
         address indexed merchant,
@@ -88,6 +96,16 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     event WithdrawalReconciled(address indexed merchant, uint256 indexed orderId, uint256 amount);
     event MerchantFrozen(address indexed merchant);
     event MerchantUnfrozen(address indexed merchant);
+    event PerTxCapSet(bytes32 indexed currency, uint256 cap);
+    event DailyLimitSet(uint256 newLimit);
+    event TrustedRelayerSet(address indexed relayer);
+    event AdminAdded(address indexed admin);
+    event AdminRemoved(address indexed admin);
+    /// @notice Emitted whenever an admin's role changes (including to NONE on
+    ///         removal). `role` is the Role enum value
+    ///         (0=NONE,1=VIEWER,2=SUPPORT,3=MANAGER,4=FINANCE).
+    event AdminRoleSet(address indexed admin, uint8 role);
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
 
     // ─── Immutables ───────────────────────────────────────────────────
     address public immutable diamond;
@@ -95,7 +113,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         resolve which token to block from user-initiated sweep —
     ///         UserProxy.sweepERC20 calls `IUsdcSource(integrator()).usdc()`.
     IERC20 public immutable usdc;
-    address public immutable owner;
+    /// @notice Root admin. Set to the deployer at construction; transferable via
+    ///         transferOwnership (e.g. to a team multisig). The owner manages the
+    ///         admin set. NOT immutable so control can move without a redeploy.
+    address public owner;
     /// @notice Pinned at deploy. Submit this address alongside the integrator
     ///         address when filing the whitelist request — the Diamond's
     ///         `registerIntegrator(integrator, proxyImpl, source)` records it
@@ -103,8 +124,16 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     address public immutable proxyImpl;
 
     // ─── Constants ────────────────────────────────────────────────────
-    uint256 public constant PER_TX_CAP = 50 * 1e6; // 50 USDC, 6 decimals
-    uint256 public constant DAILY_TX_LIMIT = 4;
+    /// @dev Per-transaction cap depends on the sale currency: India (INR) is
+    ///      capped lower than other markets. `perTxCap(currency)` resolves it.
+    ///      PER_TX_CAP is kept as the INR cap for source/ABI compatibility.
+    uint256 public constant PER_TX_CAP = 50 * 1e6;         // INR: 50 USDC
+    uint256 public constant PER_TX_CAP_INR = 50 * 1e6;     // India: 50 USDC
+    uint256 public constant PER_TX_CAP_DEFAULT = 100 * 1e6; // other markets: 100 USDC
+    /// @dev Default daily order limit. The LIVE limit is the mutable `dailyLimit`
+    ///      below (admin-settable via setDailyLimit), initialised to this. The
+    ///      constant is kept for source/ABI reference.
+    uint256 public constant DAILY_TX_LIMIT = 25;
     uint256 public constant SETTLEMENT_PERIOD = 10 minutes;
     /// @dev Hard ceiling on a merchant's stored buckets. Withdrawals compact
     ///      spent buckets, so this bounds the per-call loop cost and prevents
@@ -169,6 +198,42 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         caller-supplied address.
     mapping(address => address) public proxyMerchant;
 
+    /// @notice Optional per-currency per-tx cap override set by the owner. 0 =
+    ///         no override (fall back to the INR/default rule). This lets a NEW
+    ///         country get any cap on-chain from the admin dashboard WITHOUT a
+    ///         contract change or redeploy — adding a country never touches code.
+    mapping(bytes32 => uint256) public perTxCapOverride;
+
+    /// @notice Live daily order limit per merchant (admin-settable via
+    ///         setDailyLimit — no redeploy). Initialised to DAILY_TX_LIMIT (25).
+    uint256 public dailyLimit;
+
+    /// @notice Optional admin-set keeper allowed to call deliverFiatPayout on
+    ///         behalf of merchants (e.g. a backend that watches for ACCEPTED
+    ///         SELL orders and delivers the encrypted payout). address(0) = none.
+    ///         The merchant and owner can always deliver; this just adds a keeper.
+    ///         Set via setTrustedRelayer (MANAGER tier or higher).
+    address public trustedRelayer;
+
+    /// @notice Admin set for the admin dashboard. Kept as a plain bool for
+    ///         backwards compatibility (isAdmin / ABI): true whenever the wallet
+    ///         holds ANY non-NONE role. The role tier is in `adminRole` below.
+    mapping(address => bool) public admins;
+
+    /// @notice ROLE-BASED ACCESS CONTROL. Roles are HIERARCHICAL by value: a
+    ///         higher tier can do everything a lower tier can, PLUS its own
+    ///         actions. Five tiers, least-privilege:
+    ///         • NONE    (0): not an admin.
+    ///         • VIEWER  (1): read-only — all views, no writes. For auditors /
+    ///                        support staff who only need to SEE merchant activity.
+    ///         • SUPPORT (2): + freeze / unfreeze a merchant (the safety switch).
+    ///         • MANAGER (3): + config — setPerTxCap, setDailyLimit, setTrustedRelayer.
+    ///         • FINANCE (4): + money recovery — adminAbortWithdrawal, adminForceSettle.
+    ///         The OWNER sits above all tiers (implicitly FINANCE) and is the ONLY
+    ///         one who can assign roles, add/remove admins, or transfer ownership.
+    enum Role { NONE, VIEWER, SUPPORT, MANAGER, FINANCE }
+    mapping(address => Role) public adminRole;
+
     // ─── Reentrancy guard ─────────────────────────────────────────────
     uint256 private _locked = 1;
 
@@ -191,6 +256,43 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         _;
     }
 
+    /// @dev The owner's EFFECTIVE tier is FINANCE (the top admin tier), so a
+    ///      single hierarchy check covers both the owner and any assigned admin.
+    function _tier(address who) internal view returns (Role) {
+        return who == owner ? Role.FINANCE : adminRole[who];
+    }
+
+    /// @dev Require caller's tier >= `min`. Roles are hierarchical, so gating an
+    ///      action at MANAGER also admits FINANCE and the owner. Reverts
+    ///      NotAuthorized with the required and actual tiers for a clear panel msg.
+    modifier onlyRole(Role min) {
+        Role have = _tier(msg.sender);
+        if (uint8(have) < uint8(min)) revert NotAuthorized(uint8(min), uint8(have));
+        _;
+    }
+
+    /// @notice True if `who` can perform ANY admin action (owner or any role).
+    function isAdmin(address who) public view returns (bool) {
+        return who == owner || adminRole[who] != Role.NONE;
+    }
+
+    /// @notice True if `who` can perform MANAGER (config) actions or higher.
+    function isManager(address who) public view returns (bool) {
+        return uint8(_tier(who)) >= uint8(Role.MANAGER);
+    }
+
+    /// @notice True if `who` can perform FINANCE (money-recovery) actions.
+    function isFinance(address who) public view returns (bool) {
+        return uint8(_tier(who)) >= uint8(Role.FINANCE);
+    }
+
+    /// @notice The role tier of `who` as a uint8 (0=NONE,1=VIEWER,2=SUPPORT,
+    ///         3=MANAGER,4=FINANCE). The owner reads as 4 (FINANCE) so a panel can
+    ///         render it uniformly, even though ownership is a higher capability.
+    function roleOf(address who) external view returns (uint8) {
+        return uint8(_tier(who));
+    }
+
     // ─── Constructor ──────────────────────────────────────────────────
 
     constructor(address _diamond, address _usdc) {
@@ -198,6 +300,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         diamond = _diamond;
         usdc = IERC20(_usdc);
         owner = msg.sender;
+        dailyLimit = DAILY_TX_LIMIT; // live limit starts at the default (25)
         // Deploy the canonical UserProxy implementation. Every per-user clone
         // is a `cloneDeterministicWithImmutableArgs` of this address, with
         // `(user, address(this))` packed as the immutable args.
@@ -272,6 +375,24 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         _register(payoutId, shopName, currency);
     }
 
+    /// @notice Update the caller's editable profile fields — payout handle
+    ///         (UPI/PIX/CBU) and shop name. The offramp CURRENCY is intentionally
+    ///         NOT editable: it's locked at registration because funds and
+    ///         in-flight orders are denominated in it, and changing it mid-flight
+    ///         could route a settlement to the wrong circle. To change currency,
+    ///         a merchant uses a fresh wallet/registration.
+    /// @param payoutId New payout handle (non-empty).
+    /// @param shopName New display name.
+    function updateProfile(string calldata payoutId, string calldata shopName) external {
+        if (!registered[msg.sender]) revert NotRegistered();
+        if (bytes(payoutId).length == 0) revert InvalidAddress();
+        Merchant storage m = merchants[msg.sender];
+        if (m.isFrozen) revert MerchantIsFrozen(); // a frozen merchant can't edit
+        m.payoutId = payoutId;
+        m.shopName = shopName;
+        emit MerchantProfileUpdated(msg.sender, payoutId, shopName);
+    }
+
     function _register(
         string calldata payoutId,
         string calldata shopName,
@@ -279,6 +400,21 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ) internal {
         if (registered[msg.sender]) revert AlreadyRegistered();
         if (currency == bytes32(0)) revert InvalidCurrency();
+        // A payout target is required — without it fiat withdrawals have nowhere
+        // to land (same rule updateProfile enforces).
+        if (bytes(payoutId).length == 0) revert InvalidAddress();
+        // AUDIT (MED): enforce CANONICAL bytes32 form on BOTH entry points —
+        // left-aligned code, zero-padded, no non-zero byte after the first NUL.
+        // registerMerchant's toCurrency already guarantees this; without the same
+        // check here, registerMerchantRaw could smuggle "INR\0<junk>": it displays
+        // as "INR" via fromCurrency but fails the `== bytes32("INR")` compare in
+        // perTxCap, self-granting the 100 USDC default cap instead of INR's 50
+        // (and dodging any admin setPerTxCap("INR") override).
+        bool seenNul = false;
+        for (uint256 i = 0; i < 32; i++) {
+            if (currency[i] == 0) { seenNul = true; }
+            else if (seenNul) { revert InvalidCurrency(); }
+        }
         Merchant storage m = merchants[msg.sender];
         m.merchantAddr = msg.sender;
         m.payoutId = payoutId;
@@ -290,10 +426,22 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     // ─── IP2PIntegrator ───────────────────────────────────────────────
 
+    /// @notice Per-transaction USDC cap for a given sale currency. If the owner
+    ///         has set an override for this currency, that wins; otherwise India
+    ///         (INR) is 50 USDC and every other market is 100 USDC. This means a
+    ///         NEW country works with no contract change: it gets 100 USDC by
+    ///         default, or any owner-set amount via setPerTxCap — never a redeploy.
+    ///         View (reads the override mapping), so the UI can preview it.
+    function perTxCap(bytes32 currency) public view returns (uint256) {
+        uint256 ov = perTxCapOverride[currency];
+        if (ov != 0) return ov;
+        return currency == bytes32("INR") ? PER_TX_CAP_INR : PER_TX_CAP_DEFAULT;
+    }
+
     function validateOrder(
         address user,
         uint256 amount,
-        bytes32 /* currency */
+        bytes32 currency
     ) external onlyDiamond returns (bool allowed) {
         // SELL self-call: order.user is a merchant's own proxy (owned by this
         // integrator), used as the placer for INR withdrawals. Withdrawal
@@ -306,14 +454,20 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (!registered[user]) revert NotRegistered();
         Merchant storage m = merchants[user];
         if (m.isFrozen) revert MerchantIsFrozen();
-        if (amount > PER_TX_CAP) revert ExceedsPerTxCap();
+        // Per-tx cap keys off the merchant's REGISTERED currency, NOT the
+        // caller-supplied order currency — otherwise an INR merchant (50 USDC
+        // cap) could pass currency="BRL" to unlock the 100 USDC default and
+        // double their per-tx limit at will (audit MED). The cap reflects the
+        // merchant's market (India 50 / others 100), which is a property of the
+        // account, not of an individual sale's currency.
+        if (amount > perTxCap(m.currency)) revert ExceedsPerTxCap();
 
         uint256 today = block.timestamp / 86400;
         if (m.lastTxDate != today) {
             m.dailyTxCount = 0;
             m.lastTxDate = today;
         }
-        if (m.dailyTxCount >= DAILY_TX_LIMIT) revert DailyLimitReached();
+        if (m.dailyTxCount >= dailyLimit) revert DailyLimitReached();
         m.dailyTxCount++;
         return true;
     }
@@ -394,29 +548,22 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     // ─── Withdrawals ──────────────────────────────────────────────────
 
-    /// @notice Withdraw unlocked USDC as local fiat to the merchant's saved
-    ///         payout handle, in the merchant's OWN currency (chosen at
-    ///         registration). Places a SELL order through the merchant's own
-    ///         proxy, funded at placement. Per-merchant proxies keep in-flight
-    ///         withdrawal funds physically isolated, so one merchant's
-    ///         cancellation can never touch another's parked funds.
+    /// @notice Withdraw unlocked USDC as local fiat in the merchant's REGISTERED
+    ///         currency. Places a SELL order through the merchant's own proxy,
+    ///         funded at placement. The payout handle (UPI/PIX) is delivered
+    ///         LATER, encrypted, via `deliverFiatPayout` — so this call carries
+    ///         the relay `pubKey` (secp256k1), NOT the payout string. The last
+    ///         arg is retained for source/ABI compatibility but is unused on-chain.
     /// @param circleId The offramp circle on the Diamond for this currency,
-    ///        resolved off-chain via the subgraph. The currency itself comes
-    ///        from the merchant's on-chain profile (set at registration), so the
-    ///        caller can only influence WHICH circle is used, never the currency.
-    /// @param payoutOverride If non-empty, fiat is paid to THIS handle for this
-    ///        withdrawal instead of the saved one. Empty = use the saved payout id.
-    function withdrawFiat(uint256 amount, uint256 circleId, string calldata payoutOverride)
+    ///        resolved off-chain via the subgraph.
+    /// @param pubKey Relay public key (the same identity used for BUY orders).
+    function withdrawFiat(uint256 amount, uint256 circleId, string calldata pubKey, string calldata /* payoutOverride */)
         external
         nonReentrant
         returns (uint256 orderId)
     {
         Merchant storage m = _checkWithdraw(amount);
-        // Home case: withdraw in the merchant's REGISTERED currency. Pay to the
-        // override handle if given, else the saved payout id.
-        string memory payout = m.payoutId;
-        if (bytes(payoutOverride).length > 0) payout = payoutOverride;
-        return _withdrawFiat(m, amount, circleId, m.currency, payout);
+        return _withdrawFiat(m, amount, circleId, m.currency, pubKey);
     }
 
     /// @notice Withdraw unlocked USDC as local fiat in ANY currency the protocol
@@ -427,32 +574,41 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         merchant's own (per-merchant escrow + balance cap) and that the
     ///         Diamond accepts the currency/circle pair (else it reverts safely
     ///         and the USDC is recoverable via reconcileWithdrawal).
-    /// @param currency    The offramp currency (bytes32, e.g. "INR"|"BRL"). Non-zero.
-    /// @param payoutHandle Where this currency's fiat is paid (UPI/PIX/CBU/…). Non-empty.
+    /// @param currency The offramp currency (bytes32, e.g. "INR"|"BRL"). Non-zero.
+    /// @param pubKey   Relay public key (secp256k1) — the Diamond stores it on the
+    ///        SELL order so the LP can encrypt the payout to it. The actual payout
+    ///        handle is delivered later via `deliverFiatPayout`, NOT here.
     function withdrawFiatIn(
         uint256 amount,
         uint256 circleId,
         bytes32 currency,
-        string calldata payoutHandle
+        string calldata pubKey
     ) external nonReentrant returns (uint256 orderId) {
         if (currency == bytes32(0)) revert InvalidCurrency();
-        if (bytes(payoutHandle).length == 0) revert InvalidAddress();
+        if (bytes(pubKey).length == 0) revert InvalidAddress();
         Merchant storage m = _checkWithdraw(amount);
-        return _withdrawFiat(m, amount, circleId, currency, payoutHandle);
+        return _withdrawFiat(m, amount, circleId, currency, pubKey);
     }
 
-    /// @dev Shared core for both fiat-withdrawal entry points. Currency + payout
-    ///      are passed in (registered or chosen); everything else — per-merchant
-    ///      proxy isolation, balance debit, serialization, escrow tracking — is
+    /// @dev Shared core for both fiat-withdrawal entry points. Currency + the
+    ///      relay pubKey are passed in; everything else — per-merchant proxy
+    ///      isolation, balance debit, serialization, escrow tracking — is
     ///      identical and currency-independent.
+    /// @param pubKey The merchant's relay public key (secp256k1, the same
+    ///        identity used for BUY). The Diamond stores this on the SELL order
+    ///        and the LP encrypts the payout to it; the actual payout handle is
+    ///        delivered later, encrypted, via `deliverFiatPayout`. This field is
+    ///        NOT the payout id — passing a plain UPI/PIX string here makes the
+    ///        LP reject the order ("invalid user pubkey").
     function _withdrawFiat(
         Merchant storage m,
         uint256 amount,
         uint256 circleId,
         bytes32 currency,
-        string memory payout
+        string memory pubKey
     ) internal returns (uint256 orderId) {
         if (circleId == 0) revert InvalidCircle(); // friendly local guard
+        if (bytes(pubKey).length == 0) revert InvalidAddress(); // need a real relay key
         // MED-1: serialize a merchant's fiat withdrawals. The merchant has ONE
         // proxy, so two concurrent SELLs would commingle principals on it and a
         // per-order top-up/reconcile (which key off the proxy's aggregate
@@ -464,9 +620,11 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // merchant's own proxy, never commingled with other merchants'.
         address merchantProxy = _ensureProxy(m.merchantAddr);
         usdc.safeTransfer(merchantProxy, amount);
+        // userPubKey = the relay pubkey (NOT the payout). The payout/UPI is set
+        // later, encrypted, via deliverFiatPayout -> setSellOrderUpi.
         bytes memory data = abi.encodeCall(
             IB2BGateway.placeB2BSellOrder,
-            (merchantProxy, amount, currency, payout, circleId, 0, 0)
+            (merchantProxy, amount, currency, pubKey, circleId, 0, 0)
         );
         bytes memory result = UserProxy(merchantProxy).execute(diamond, data, address(usdc), 0);
         orderId = abi.decode(result, (uint256));
@@ -490,15 +648,24 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         tops it up by the FEE from the integrator's USDC, grants the
     ///         allowance, and calls setSellOrderUpi so the Diamond can pull and
     ///         settle. Without this the Diamond auto-cancels the SELL (the
-    ///         "fee bug"). Permissionless and idempotent: anyone may poke it once
-    ///         the Diamond has populated actualUsdtAmount; only the recorded
-    ///         merchant benefits. Currency-agnostic — works for any offramp.
+    ///         "fee bug"). Currency-agnostic — works for any offramp.
+    ///
+    ///         AUDIT-MED (griefing fix): this step is AUTHORIZED, not permissionless.
+    ///         `encPayout` is the payout payload the LP decrypts — if any caller
+    ///         could supply it, an attacker could front-run the real merchant,
+    ///         mark upiDelivered with a bogus/attacker payload, brick the fiat
+    ///         channel (owner-only recovery), and burn the merchant's fee. Only
+    ///         the recorded merchant, the owner, or the owner-set trusted relayer
+    ///         may deliver — all of which act on the merchant's behalf.
     /// @param encPayout The Diamond-encrypted payout payload for this order
     ///        (built off-chain from the order's pubkey + the merchant's saved
     ///        payout id), same as the BUY flow supplies a pubkey.
     function deliverFiatPayout(uint256 orderId, string calldata encPayout) external nonReentrant {
         PendingWithdrawal storage w = withdrawals[orderId];
         if (w.merchant == address(0)) revert WithdrawalNotFound();
+        // Only the merchant, owner, or trusted relayer — never an arbitrary caller.
+        if (msg.sender != w.merchant && msg.sender != owner && msg.sender != trustedRelayer)
+            revert OnlyOwner();
         if (w.settled) revert WithdrawalAlreadySettled();
         if (w.upiDelivered) revert WithdrawalAlreadySettled();
 
@@ -621,10 +788,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // no refund → no re-credit).
         uint256 owedBack = w.amount + w.feeAdvanced;
         uint256 recredit = owedBack < proxyBal ? owedBack : proxyBal;
-        // If the SELL had reached PAID (fiat was attempted), re-lock the credit
-        // under a fresh settlement window so the fraud/clawback control is
-        // preserved; the never-accepted case unlocks immediately (now-1).
-        uint256 unlockAt = w.upiDelivered ? block.timestamp + SETTLEMENT_PERIOD : block.timestamp - 1;
+        // Re-lock under a fresh settlement window when the SELL had reached PAID
+        // (fiat attempted) OR the merchant is FROZEN — a frozen account must not
+        // get instantly-spendable funds back (mirrors adminAbortWithdrawal's
+        // intent), otherwise this permissionless path would undermine the freeze.
+        // Only the clean never-accepted, not-frozen case unlocks immediately.
+        uint256 unlockAt = (w.upiDelivered || m.isFrozen)
+            ? block.timestamp + SETTLEMENT_PERIOD
+            : block.timestamp - 1;
         _creditBucket(m, recredit, unlockAt);
 
         emit WithdrawalReconciled(w.merchant, orderId, recredit);
@@ -744,12 +915,87 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     // ─── Admin ────────────────────────────────────────────────────────
 
-    function freezeMerchant(address merchant) external onlyOwner {
+    /// @notice OWNER-ONLY: assign an admin's role tier. This is the single entry
+    ///         point for role-based access. Roles are hierarchical — a higher tier
+    ///         includes every lower tier's powers. Pass Role.NONE to revoke. Keeps
+    ///         the legacy `admins` bool in sync (true for any non-NONE role) so
+    ///         isAdmin / existing integrations keep working. No redeploy needed.
+    /// @param who  The admin wallet.
+    /// @param role 0=NONE(revoke) 1=VIEWER 2=SUPPORT 3=MANAGER 4=FINANCE.
+    function setRole(address who, Role role) public onlyOwner {
+        if (who == address(0)) revert InvalidAddress();
+        bool wasAdmin = adminRole[who] != Role.NONE;
+        adminRole[who] = role;
+        admins[who] = role != Role.NONE;
+        emit AdminRoleSet(who, uint8(role));
+        // Keep the legacy add/remove events firing for any listener still on them.
+        if (role != Role.NONE && !wasAdmin) emit AdminAdded(who);
+        if (role == Role.NONE && wasAdmin) emit AdminRemoved(who);
+    }
+
+    /// @notice OWNER-ONLY: add an admin. Back-compat shim — grants FINANCE (the
+    ///         full admin tier, matching the previous flat-admin behaviour where a
+    ///         single admin could do everything). Use setRole(who, <tier>) for a
+    ///         narrower role (e.g. Role.SUPPORT for freeze-only, Role.VIEWER for
+    ///         read-only).
+    function addAdmin(address who) external onlyOwner {
+        setRole(who, Role.FINANCE);
+    }
+
+    /// @notice OWNER-ONLY: remove an admin (revoke all roles).
+    function removeAdmin(address who) external onlyOwner {
+        setRole(who, Role.NONE);
+    }
+
+    /// @notice OWNER-ONLY: move root ownership (e.g. to a team multisig). The new
+    ///         owner then controls the admin set and can transfer again. Reverts
+    ///         on the zero address to avoid bricking admin control.
+    function transferOwnership(address newOwner) external onlyOwner {
+        if (newOwner == address(0)) revert InvalidAddress();
+        address prev = owner;
+        owner = newOwner;
+        emit OwnershipTransferred(prev, newOwner);
+    }
+
+    /// @notice Set (or clear) the per-transaction USDC cap for a currency. Lets
+    ///         the team onboard a NEW country and tune its cap entirely from the
+    ///         admin dashboard — no contract change, no redeploy. Pass cap = 0 to
+    ///         clear the override and fall back to the INR/default rule.
+    /// @param currency The sale currency (bytes32, e.g. bytes32("MXN")).
+    /// @param cap      Per-tx cap in USDC 6-decimals (e.g. 75 * 1e6). 0 = clear.
+    function setPerTxCap(bytes32 currency, uint256 cap) external onlyRole(Role.MANAGER) {
+        if (currency == bytes32(0)) revert InvalidCurrency();
+        perTxCapOverride[currency] = cap;
+        emit PerTxCapSet(currency, cap);
+    }
+
+    /// @notice Set the live daily order limit per merchant (admin-settable — no
+    ///         redeploy). Must be non-zero (0 would block all orders). Applies
+    ///         from the next order; a merchant already at/over the new lower
+    ///         limit simply can't place more today.
+    /// @param newLimit New max orders per merchant per UTC day.
+    function setDailyLimit(uint256 newLimit) external onlyRole(Role.MANAGER) {
+        if (newLimit == 0) revert InvalidQuantity();
+        dailyLimit = newLimit;
+        emit DailyLimitSet(newLimit);
+    }
+
+    /// @notice Set (or clear via address(0)) the keeper allowed to call
+    ///         deliverFiatPayout on merchants' behalf. Owner + merchant can
+    ///         always deliver regardless.
+    function setTrustedRelayer(address relayer) external onlyRole(Role.MANAGER) {
+        trustedRelayer = relayer;
+        emit TrustedRelayerSet(relayer);
+    }
+
+    /// @dev SUPPORT tier or higher — freezing is the baseline safety action.
+    function freezeMerchant(address merchant) external onlyRole(Role.SUPPORT) {
         merchants[merchant].isFrozen = true;
         emit MerchantFrozen(merchant);
     }
 
-    function unfreezeMerchant(address merchant) external onlyOwner {
+    /// @dev SUPPORT tier or higher.
+    function unfreezeMerchant(address merchant) external onlyRole(Role.SUPPORT) {
         merchants[merchant].isFrozen = false;
         emit MerchantUnfrozen(merchant);
     }
@@ -762,7 +1008,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         Sweeps the merchant's proxy USDC back, re-credits their principal
     ///         (locked again under a fresh settlement period so a frozen account
     ///         can't immediately re-extract), and frees the in-flight slot.
-    function adminAbortWithdrawal(uint256 orderId) external onlyOwner nonReentrant {
+    function adminAbortWithdrawal(uint256 orderId) external onlyRole(Role.FINANCE) nonReentrant {
         PendingWithdrawal storage w = withdrawals[orderId];
         if (w.merchant == address(0)) revert UnknownWithdrawal();
         if (w.settled) revert WithdrawalAlreadySettled();
@@ -803,7 +1049,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         proxyBal ≈ 0 and recredit ≈ 0. Owner-gated and requires the
     ///         Diamond status to be CANCELLED (a real clawback), so it cannot be
     ///         used to reverse a COMPLETED payout.
-    function adminForceSettle(uint256 orderId) external onlyOwner nonReentrant {
+    function adminForceSettle(uint256 orderId) external onlyRole(Role.FINANCE) nonReentrant {
         PendingWithdrawal storage w = withdrawals[orderId];
         if (w.merchant == address(0)) revert UnknownWithdrawal();
         if (w.settled) revert WithdrawalAlreadySettled();
@@ -882,7 +1128,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         Merchant storage m = merchants[merchant];
         uint256 today = block.timestamp / 86400;
         usedToday = m.lastTxDate == today ? m.dailyTxCount : 0;
-        return (usedToday, DAILY_TX_LIMIT);
+        return (usedToday, dailyLimit);
     }
 
     /// @notice The merchant's offramp currency as a readable code ("INR",

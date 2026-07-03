@@ -1,23 +1,33 @@
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   reactStrictMode: true,
-  // Gradual JS→TS migration: types power the editor, but a stray library/DOM
-  // typing mismatch shouldn't block a production build. Tighten incrementally.
-  typescript: { ignoreBuildErrors: true },
+  // The app now typechecks clean (npm run typecheck passes), so let the build
+  // ENFORCE types — a future bad thirdweb/viem API call fails the build instead
+  // of silently shipping. ESLint is still skipped (no lint config wired up).
+  typescript: { ignoreBuildErrors: false },
   eslint: { ignoreDuringBuilds: true },
-  // Privy's smart-wallets module imports `permissionless` via subpath exports
-  // that the dev bundler resolves inconsistently — transpile them so the
-  // ERC-4337 stack loads in both dev and production.
-  transpilePackages: [
-    "@privy-io/react-auth",
-    "permissionless",
-  ],
+  // Tree-shake barrel imports from the heavy wallet/UI deps so a page only pulls
+  // the icons/helpers it actually uses instead of the whole package — cuts the
+  // dev cold-compile module count and shrinks the production first-load bundle.
+  experimental: {
+    optimizePackageImports: [
+      "thirdweb",
+      "wagmi",
+      "viem",
+      "@tanstack/react-query",
+      "qrcode.react",
+    ],
+  },
   webpack: (config) => {
-    // wagmi's MetaMask connector pulls an optional RN-only dep; stub it so the
-    // browser build doesn't choke on it.
+    // Stub optional deps that transitive wallet libs (wagmi/walletconnect/pino)
+    // reference only in code paths this app never hits — so the browser build
+    // doesn't emit "Module not found" noise for them.
     config.resolve.alias = {
       ...config.resolve.alias,
       "@react-native-async-storage/async-storage": false,
+      // pino (via walletconnect, pulled in by thirdweb) optionally requires
+      // pino-pretty for pretty-printing; it's dev-only logging we never use.
+      "pino-pretty": false,
     };
     return config;
   },

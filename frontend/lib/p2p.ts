@@ -99,7 +99,7 @@ export async function resolveInrCircleId() {
  * — the integrator forwards (currency, circleId, pubKey) to the Diamond and
  * passes its own 0,0 for preferredPaymentChannelConfigId / fiatAmountLimit.
  *
- * @param signer        CheckoutSigner (Privy wallet adapter)
+ * @param signer        CheckoutSigner (thirdweb smart-account adapter)
  * @param publicClient  viem public client for receipt parsing
  * @param quantity      bigint product-2 units (USDC cents)
  * @param getIdentity   async () => RelayIdentity ({ publicKey })
@@ -123,7 +123,7 @@ export function makePlaceOrder({ signer, publicClient, quantity, getIdentity }) 
         quantity,
         stringToHex(ctx.currency.symbol, { size: 32 }),
         BigInt(circleId),
-        identity.publicKey, // 128-char hex, no prefix
+        identity.publicKey, // 128-char hex, no prefix (BUY path — already works, #307/#309)
       ],
     });
 

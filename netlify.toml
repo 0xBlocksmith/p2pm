@@ -1,8 +1,10 @@
-# Next.js app in the frontend/ subfolder. The Netlify "Base directory" is set to
-# `frontend`, so the build already runs inside frontend/ — commands and the
-# publish path here are RELATIVE to that base. publish = .next (≠ base).
+# Next.js app in the frontend/ subfolder. `base` is declared HERE (not only in
+# the Netlify UI) so re-importing the site can never build at the repo root.
+# Commands and the publish path are RELATIVE to that base. publish = .next.
+# `npm ci` (not install) — reproducible builds from the committed lockfile.
 [build]
-  command = "npm install && npm run build"
+  base = "frontend"
+  command = "npm ci && npm run build"
   publish = ".next"
 
 [[plugins]]

@@ -6,7 +6,7 @@ import { useReadContract } from "wagmi";
 import { Nav } from "../../components/Nav";
 import { useMerchant } from "../../components/useMerchant";
 import { Icon } from "../../components/Icons";
-import { CONTRACT_ADDRESS, INTEGRATOR_ABI, PER_TX_CAP_USDC } from "../../lib/contract";
+import { CONTRACT_ADDRESS, INTEGRATOR_ABI, perTxCapUsdc, currencyFromBytes32 } from "../../lib/contract";
 import { fetchUsdcRate } from "../../lib/rates";
 import { loadCountry, fmtFiat, COUNTRIES } from "../../lib/countries";
 import { useT } from "../../lib/i18n";
@@ -22,6 +22,20 @@ const CheckoutWidget = dynamic(
 
 // Quick-amount presets per country (local fiat).
 const QUICK = { INR: [10, 20, 50], BRL: [5, 10, 20], ARS: [500, 1000, 2000] };
+
+// Format the RAW typed amount for display: group the integer part with the
+// country's locale but keep the decimal part EXACTLY as typed (so "10.", "10.1",
+// "10.10" all render faithfully while the merchant is entering them). Passing the
+// string through a number formatter would round/strip the in-progress decimal.
+function fmtTyped(raw: string, country: any): string {
+  if (!raw) return "0";
+  const [intPart, decPart] = raw.split(".");
+  let grouped = "0";
+  try {
+    grouped = (Number(intPart) || 0).toLocaleString(country?.locale || undefined);
+  } catch { grouped = intPart || "0"; }
+  return decPart !== undefined ? `${grouped}.${decPart}` : grouped;
+}
 
 // A short success chime + vibration — like every POS app.
 function paymentFeedback() {
@@ -59,9 +73,49 @@ export default function PosQr() {
   const [liveWidget, setLiveWidget] = useState(null);
   const [done, setDone] = useState(null);
   const [payError, setPayError] = useState("");
+  // A payment session that was started but not finished (widget closed / left).
+  // Persisted so the merchant can RESUME it instead of losing the sale, and can
+  // CANCEL a stuck one. Cleared on complete/cancel. (Bug: closing the p2p dialog
+  // used to orphan the session forever.)
+  const [pendingSession, setPendingSession] = useState(null);
+  const SESSION_KEY = "payqr.pendingSession";
+  const SESSION_TTL_MS = 15 * 60 * 1000; // 15 min — a stale session auto-expires
 
   // Default the sale currency to the merchant's registered country.
   useEffect(() => { setCountry(loadCountry()); }, []);
+
+  // On load, restore a recent unfinished session (drop it if older than the TTL).
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(SESSION_KEY);
+      if (!raw) return;
+      const s = JSON.parse(raw);
+      if (!s?.startedAt || Date.now() - s.startedAt > SESSION_TTL_MS) {
+        localStorage.removeItem(SESSION_KEY);
+        return;
+      }
+      setPendingSession(s);
+    } catch { localStorage.removeItem(SESSION_KEY); }
+  }, []);
+
+  function saveSession(s) {
+    const rec = { ...s, startedAt: Date.now() };
+    try { localStorage.setItem(SESSION_KEY, JSON.stringify(rec)); } catch {}
+    setPendingSession(rec);
+  }
+  function clearSession() {
+    try { localStorage.removeItem(SESSION_KEY); } catch {}
+    setPendingSession(null);
+  }
+  function resumeSession() {
+    if (!pendingSession) return;
+    setPayError(""); setDone(null);
+    setLiveWidget({
+      usdcAmount: BigInt(pendingSession.usdcAmount),
+      quantity: BigInt(pendingSession.quantity),
+      fiat: pendingSession.fiat, usdc: pendingSession.usdc,
+    });
+  }
 
   // Every configured country is selectable as the accept currency. The widget
   // resolves the circle for the picked currency at order time; if the protocol
@@ -88,8 +142,19 @@ export default function PosQr() {
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "getDailyTxInfo",
     args: [address], query: { enabled: !!address, refetchInterval: 20000 },
   });
-  const [used, limit] = daily ?? [0n, 4n];
+  const [used, limit] = daily ?? [0n, 25n];
   const limitReached = daily ? used >= limit : false;
+
+  // LIVE per-tx cap: read perTxCap(registeredCurrency) straight from the contract
+  // (info[2] is the registered currency as bytes32) so the cap ALWAYS matches
+  // on-chain — including any admin setPerTxCap override — with no redeploy. Falls
+  // back to the hardcoded 50/100 mirror only until this read resolves.
+  const registeredCurrencyB32 = (info?.[2] as `0x${string}`) || undefined;
+  const { data: liveCapRaw } = useReadContract({
+    address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "perTxCap",
+    args: [registeredCurrencyB32 as `0x${string}`],
+    query: { enabled: !!registeredCurrencyB32 },
+  });
 
   useEffect(() => {
     if (!country) return;
@@ -102,15 +167,32 @@ export default function PosQr() {
 
   const amtNum = Number(amt) || 0;
   const usdcEquiv = rate && amtNum > 0 ? amtNum / rate.rate : 0;
-  const overCap = usdcEquiv > PER_TX_CAP_USDC;
+  // Per-tx cap keys off the merchant's REGISTERED currency (what the contract
+  // enforces in validateOrder), NOT the currency picked in the terminal — else
+  // an INR merchant (50 cap) charging in BRL would be shown a 100 cap and the
+  // on-chain placeOrder would revert ExceedsPerTxCap.
+  // Prefer the LIVE on-chain cap (reflects admin setPerTxCap overrides); fall
+  // back to the hardcoded 50/100 mirror only while the read is loading.
+  const registeredCode = currencyFromBytes32(info?.[2] as string);
+  const capUsdc =
+    liveCapRaw != null
+      ? Number(liveCapRaw) / 1e6
+      : perTxCapUsdc(registeredCode || country?.code || "INR");
+  const overCap = usdcEquiv > capUsdc;
 
   function press(k) {
     setError("");
     setAmt((cur) => {
       if (k === "del") return cur.slice(0, -1);
       if (k === ".") return cur.includes(".") ? cur : (cur || "0") + ".";
+      // Digit: max 2 decimal places once a "." is present.
+      if (cur.includes(".")) {
+        const decimals = cur.split(".")[1] ?? "";
+        if (decimals.length >= 2) return cur;
+      }
       const next = (cur + k).replace(/^0+(?=\d)/, "");
-      return next.length > 9 ? cur : next;
+      // Cap total length so the display stays sane (10 chars incl. the dot).
+      return next.length > 10 ? cur : next;
     });
   }
 
@@ -120,15 +202,22 @@ export default function PosQr() {
     if (amtNum <= 0) return setError(`Enter the amount in ${country.code}.`);
     if (overCap) {
       return setError(
-        `Max ${PER_TX_CAP_USDC} USDC per sale (≈ ${fmtFiat(country, PER_TX_CAP_USDC * rate.rate)} now).`
+        `Max ${capUsdc} USDC per sale (≈ ${fmtFiat(country, capUsdc * rate.rate)} now).`
       );
     }
     const quantity = BigInt(Math.round(usdcEquiv * 100));
     if (quantity === 0n) return setError("Amount too small.");
     setLastAmt(amt);
-    setLiveWidget({
-      usdcAmount: BigInt(Math.round(usdcEquiv * 1e6)),
-      quantity, fiat: amtNum, usdc: usdcEquiv,
+    // Derive usdcAmount FROM quantity (× 0.01 USDC = 10_000 6-dec units) so the
+    // amount shown to the customer in the widget exactly equals the on-chain
+    // order total (quantity × unit price). Rounding them independently could
+    // diverge by up to half a cent.
+    const usdcAmount = quantity * 10_000n;
+    setLiveWidget({ usdcAmount, quantity, fiat: amtNum, usdc: usdcEquiv });
+    // Persist so the session survives a closed dialog / refresh and can be resumed.
+    saveSession({
+      usdcAmount: usdcAmount.toString(), quantity: quantity.toString(),
+      fiat: amtNum, usdc: usdcEquiv, currency: country.code,
     });
   }
 
@@ -173,13 +262,31 @@ export default function PosQr() {
               onComplete={(orderId) => {
                 paymentFeedback();
                 setDone({ orderId: String(orderId), usdc: liveWidget.usdc, fiat: liveWidget.fiat });
-                setLiveWidget(null); setAmt(""); refetchDaily();
+                setLiveWidget(null); setAmt(""); clearSession(); refetchDaily();
               }}
-              onCancel={() => { setLiveWidget(null); refetchDaily(); }}
+              onCancel={() => { setLiveWidget(null); clearSession(); refetchDaily(); }}
+              // Closing the dialog does NOT discard the session — it stays so the
+              // merchant can resume it from the "pending payment" banner below.
               onClose={() => setLiveWidget(null)}
               onError={(m) => { setPayError(m); setLiveWidget(null); }}
             />
           </>
+        )}
+
+        {/* Resume / cancel an unfinished payment (dialog was closed or app left).
+            Fixes the orphaned-session bug + gives a way out of a stuck order. */}
+        {pendingSession && !liveWidget && !done && (
+          <div className="panel" style={{ textAlign: "center" }}>
+            <h2>Payment in progress</h2>
+            <p className="muted" style={{ margin: "6px 0 12px" }}>
+              You have an unfinished sale of {fmtFiat(country, pendingSession.fiat)} {pendingSession.currency}.
+              Resume to show the QR again, or cancel to start over.
+            </p>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="btn" style={{ flex: 1 }} onClick={resumeSession}>Resume payment</button>
+              <button className="btn ghost" style={{ flex: 1 }} onClick={clearSession}>Cancel</button>
+            </div>
+          </div>
         )}
 
         {/* Friendly message when the QR can't be created (no LP available) */}
@@ -234,7 +341,7 @@ export default function PosQr() {
         )}
 
         {/* Number-pad terminal */}
-        {!limitReached && !liveWidget && !done && !payError && (
+        {!limitReached && !liveWidget && !done && !payError && !pendingSession && (
           <div className="terminal">
             {/* charge-currency picker — only shows currencies the protocol can
                 settle (live circles). Lets a merchant accept in any supported
@@ -263,14 +370,17 @@ export default function PosQr() {
             )}
             <div className="t-amount">
               <div className="t-shop">{shopLabel || t("qr.newSale")}</div>
-              <div className="t-value">{fmtFiat(country, amt || 0)}</div>
+              {/* Show the RAW typed string (preserves "10." and decimals while
+                  typing) with grouping on the integer part only — passing `amt`
+                  through fmtFiat would round away the decimal being entered. */}
+              <div className="t-value">{country.symbol}{fmtTyped(amt, country)}</div>
               <div className="t-sub">
                 {rate
                   ? amtNum > 0 ? `≈ ${usdcEquiv.toFixed(2)} USDC ${t("qr.youKeep")}` : t("qr.enterAmount")
                   : t("qr.fetchingRate")}
               </div>
               {overCap && rate && (
-                <div className="t-warn">Max {fmtFiat(country, PER_TX_CAP_USDC * rate.rate)} per sale</div>
+                <div className="t-warn">Max {fmtFiat(country, capUsdc * rate.rate)} per sale</div>
               )}
             </div>
 
@@ -298,7 +408,7 @@ export default function PosQr() {
             <button className="btn t-charge"
               style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
               disabled={!ready || !rate || amtNum <= 0 || overCap} onClick={generate}>
-              <Icon.Qr /> {amtNum > 0 ? `${t("common.acceptPayment")} · ${fmtFiat(country, amt)}` : t("common.acceptPayment")}
+              <Icon.Qr /> {amtNum > 0 ? `${t("common.acceptPayment")} · ${country.symbol}${fmtTyped(amt, country)}` : t("common.acceptPayment")}
             </button>
             {error && <p className="error" style={{ textAlign: "center" }}>{error}</p>}
             <div className="t-foot">{String(used)} / {String(limit)} sales today</div>

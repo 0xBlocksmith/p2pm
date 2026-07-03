@@ -98,6 +98,34 @@ export function markPrefsSet(): void {
   try { localStorage.setItem(DONE_KEY, "1"); } catch {}
 }
 
+/**
+ * Clear all per-merchant browser state on LOGOUT. Without this, a shared device
+ * leaks one merchant's data into the next account: the p2p RELAY IDENTITY (so
+ * merchant B would place orders whose payout comms are encrypted to merchant A's
+ * key), the pending-sale banner, and the country/language/onboarding prefs.
+ * thirdweb's own disconnect only clears its session, not our app storage.
+ */
+export function clearLocalUserData(): void {
+  const exact = [
+    KEY, LANG_KEY, DONE_KEY,
+    "payqr.pendingSession",     // an unfinished sale (qr page)
+    "payqr.dismissedStuck",     // locally-dismissed stuck orders (qr/dashboard)
+    "payqr.tourDone", "payqr.tourPending",
+    "@P2PME:RELAY_IDENTITY",    // legacy global relay keypair (pre address-scoping)
+  ];
+  // Prefix-match: every per-address relay identity (payqr.relay:0x…) — so a
+  // shared device never leaves one merchant's payout key for the next account.
+  try {
+    exact.forEach((k) => localStorage.removeItem(k));
+    const toRemove: string[] = [];
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("payqr.relay:")) toRemove.push(k);
+    }
+    toRemove.forEach((k) => localStorage.removeItem(k));
+  } catch { /* ignore */ }
+}
+
 /** Format a fiat amount with the country's symbol + locale grouping. */
 export function fmtFiat(
   country: Country,

@@ -2,15 +2,16 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { usePrivy } from "@privy-io/react-auth";
-import { useReadContract } from "wagmi";
+import { useAuth } from "../../components/useAuth";
+import { useReadContract, usePublicClient } from "wagmi";
+import { encodeFunctionData } from "viem";
 import { Nav } from "../../components/Nav";
 import { useMerchant } from "../../components/useMerchant";
 import { useSmartAccount } from "../../components/useSmartAccount";
 import { Icon } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI } from "../../lib/contract";
 import {
-  COUNTRIES, LANGUAGES, loadCountry, loadLang, saveCountry, saveLang,
+  COUNTRIES, LANGUAGES, loadCountry, loadLang, saveCountry, saveLang, clearLocalUserData,
 } from "../../lib/countries";
 import { useTheme } from "../../components/theme";
 import { useT } from "../../lib/i18n";
@@ -25,9 +26,10 @@ const SCAN = "https://sepolia.basescan.org";
 
 export default function Settings() {
   const router = useRouter();
-  const { user, logout } = usePrivy();
+  const { logout, email } = useAuth();
   useMerchant(); // page guard (auth + prefs)
-  const { address } = useSmartAccount(); // same source the account menu uses
+  const { address, sendTransaction } = useSmartAccount(); // same source the account menu uses
+  const publicClient = usePublicClient();
   const { theme, setTheme } = useTheme();
   const { t, lang, setLang } = useT();
   const [country, setCountry] = useState(null);
@@ -35,13 +37,45 @@ export default function Settings() {
 
   useEffect(() => { setCountry(loadCountry()); }, []);
 
-  const { data: info } = useReadContract({
+  const { data: info, refetch: refetchInfo } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "getMerchantInfo",
     args: [address], query: { enabled: !!address },
   });
   const payoutId = info?.[0] || "";
   const shopName = info?.[1] || "";
-  const email = user?.email?.address || user?.google?.email || "";
+
+  // ── Edit profile (shop name + payout handle) via updateProfile ──
+  const [editing, setEditing] = useState(false);
+  const [edShop, setEdShop] = useState("");
+  const [edPayout, setEdPayout] = useState("");
+  const [savingProfile, setSavingProfile] = useState(false);
+  const [profileMsg, setProfileMsg] = useState("");
+
+  function startEdit() {
+    setEdShop(shopName); setEdPayout(payoutId); setProfileMsg(""); setEditing(true);
+  }
+  async function saveProfile() {
+    setProfileMsg("");
+    if (!edShop.trim()) return setProfileMsg("Enter a shop name.");
+    if (!edPayout.trim()) return setProfileMsg(`Enter your ${country.payoutLabel}.`);
+    if (country.validatePayout && !country.validatePayout(edPayout.trim())) {
+      return setProfileMsg(`Enter a valid ${country.payoutLabel} (like ${country.payoutPlaceholder}).`);
+    }
+    if (!sendTransaction) return setProfileMsg("Wallet still connecting — try again in a moment.");
+    setSavingProfile(true);
+    try {
+      const data = encodeFunctionData({
+        abi: INTEGRATOR_ABI, functionName: "updateProfile",
+        args: [edPayout.trim(), edShop.trim()],
+      });
+      const hash = await sendTransaction({ to: CONTRACT_ADDRESS, data });
+      const receipt = await publicClient.waitForTransactionReceipt({ hash });
+      if (receipt.status === "reverted") throw new Error("Couldn't save — the change was rejected on-chain.");
+      setProfileMsg("Saved ✓"); setEditing(false); refetchInfo();
+    } catch (err) {
+      setProfileMsg(err?.shortMessage || err?.message || "Couldn't save. Try again.");
+    } finally { setSavingProfile(false); }
+  }
 
   function pickCountry(c) { setCountry(c); saveCountry(c.id); }
   function pickLang(code) { setLang(code); }
@@ -68,9 +102,37 @@ export default function Settings() {
           </div>
         </div>
 
-        {/* shop details (on-chain) */}
+        {/* shop details (on-chain) — editable */}
         <div className="set-group">
-          <div className="set-glabel">{t("set.shop")}</div>
+          <div className="set-glabel" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span>{t("set.shop")}</span>
+            {!editing && (
+              <button className="set-link" style={{ padding: 0 }} onClick={startEdit}>Edit</button>
+            )}
+          </div>
+
+          {editing ? (
+            <>
+              <label className="set-k" style={{ display: "block", marginTop: 6 }}>{t("set.shopName")}</label>
+              <input className="input" value={edShop} onChange={(e) => setEdShop(e.target.value)}
+                placeholder="Your shop name" />
+              <label className="set-k" style={{ display: "block", marginTop: 10 }}>{country.payoutLabel}</label>
+              <input className="input" value={edPayout} onChange={(e) => setEdPayout(e.target.value)}
+                placeholder={country.payoutPlaceholder} />
+              <p className="tiny" style={{ color: "var(--muted)", margin: "8px 0 0" }}>
+                Currency ({country.code}) can't be changed after registration.
+              </p>
+              {profileMsg && <p className={profileMsg.includes("✓") ? "success" : "error"} style={{ marginTop: 6 }}>{profileMsg}</p>}
+              <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                <button className="btn" style={{ flex: 1 }} disabled={savingProfile} onClick={saveProfile}>
+                  {savingProfile ? "Saving…" : "Save"}
+                </button>
+                <button className="btn ghost" style={{ flex: 1 }} disabled={savingProfile}
+                  onClick={() => { setEditing(false); setProfileMsg(""); }}>Cancel</button>
+              </div>
+            </>
+          ) : (
+            <>
           <div className="set-item">
             <span className="set-k">{t("set.shopName")}</span>
             <span className="set-v">{shopName || "—"}</span>
@@ -79,6 +141,9 @@ export default function Settings() {
             <span className="set-k">{country.payoutLabel}</span>
             <span className="set-v">{payoutId || "—"}</span>
           </div>
+            </>
+          )}
+
           <div className="set-item">
             <span className="set-k">{t("set.wallet")}</span>
             {address ? (
@@ -137,7 +202,15 @@ export default function Settings() {
           </div>
         </div>
 
-        <button className="btn ghost set-logout" onClick={() => logout().then(() => router.replace("/login"))}>
+        <button
+          className="btn ghost set-logout"
+          onClick={() => {
+            // Wipe per-merchant local state BEFORE leaving so nothing leaks to the
+            // next account on a shared device (relay key, pending sale, prefs).
+            clearLocalUserData();
+            logout().finally(() => router.replace("/login"));
+          }}
+        >
           {t("set.logout")}
         </button>
         <p className="tiny" style={{ textAlign: "center", color: "var(--muted)", margin: "12px 0 0" }}>

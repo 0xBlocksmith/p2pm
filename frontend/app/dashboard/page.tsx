@@ -38,8 +38,12 @@ export default function Dashboard() {
   const [tourForce, setTourForce] = useState(false);
   const [toast, setToast] = useState("");       // settlement-ready banner
   const [walletOpen, setWalletOpen] = useState(false);
+  const [dismissed, setDismissed] = useState<string[]>([]); // locally-hidden stuck orders
 
   useEffect(() => { setCountry(loadCountry()); }, []);
+  useEffect(() => {
+    try { setDismissed(JSON.parse(localStorage.getItem("payqr.dismissedStuck") || "[]")); } catch {}
+  }, []);
 
   // Registration is checked lazily: the dashboard opens for everyone, and we
   // route to /onboarding only when the merchant tries to accept a payment.
@@ -104,7 +108,7 @@ export default function Dashboard() {
   }, [address]);
 
   const [pending, available, , isFrozen] = balance ?? [0n, 0n, 0n, false];
-  const [used, limit] = daily ?? [0n, 4n];
+  const [used, limit] = daily ?? [0n, 25n];
   const availUsdc = Number(available) / 1e6;
   const fiatEquiv = rate && country ? availUsdc * rate.rate : null;
 
@@ -145,11 +149,25 @@ export default function Dashboard() {
   const recent = rows.slice(0, 3);
 
   // Stuck order: a sale still "Waiting" (no payment partner accepted) more than
-  // 3 minutes after it was placed. We surface a Retry so the merchant can take
-  // the payment again instead of staring at a dead QR.
+  // 3 minutes after it was placed. We surface it so the merchant can start a new
+  // sale or DISMISS the row instead of staring at a dead QR.
+  //
+  // NOTE: there is NO merchant-callable on-chain cancel (the contract's
+  // onOrderCancel is Diamond-only — the p2p protocol cancels an unmatched order
+  // itself after a timeout). So "Dismiss" here is a LOCAL hide: it removes the
+  // row from this merchant's view. The order still resolves on-chain on its own
+  // (it will show as cancelled once the protocol times it out).
   const stuck = rows.find(
-    (t) => t.status === "matching" && (Date.now() - new Date(t.createdAt).getTime()) > 180_000
+    (t) =>
+      t.status === "matching" &&
+      !dismissed.includes(String(t.orderId)) &&
+      (Date.now() - new Date(t.createdAt).getTime()) > 180_000
   );
+  function dismissStuck(orderId) {
+    const next = [...dismissed, String(orderId)];
+    setDismissed(next);
+    try { localStorage.setItem("payqr.dismissedStuck", JSON.stringify(next)); } catch {}
+  }
 
   // Daily close ("Z-report") — what a shop owner screenshots at end of day for
   // their own books. Shares the day's totals via the native share sheet.
@@ -237,6 +255,23 @@ export default function Dashboard() {
         </div>
 
 
+        {/* stuck sale — waiting too long for a payment partner. Offer a new sale
+            or a local dismiss (there's no merchant on-chain cancel; the protocol
+            times the order out itself). */}
+        {stuck && (
+          <div className="stuck-card" style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 14px", borderRadius: 12, border: "1px solid var(--warn-border, #e0b100)", background: "var(--warn-soft, rgba(224,177,0,.08))", margin: "12px 0" }}>
+            <span className="stuck-ico"><Icon.Clock /></span>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 700 }}>{t("dash.stuckTitle")}</div>
+              <div className="muted" style={{ fontSize: 12 }}>
+                #{stuck.orderId} · {fmtUsdc(stuck.amount)} USDC · {timeAgo(stuck.createdAt)}
+              </div>
+            </div>
+            <button className="btn small secondary" onClick={acceptPayment}>{t("dash.newSale")}</button>
+            <button className="btn small ghost" onClick={() => dismissStuck(stuck.orderId)}>{t("dash.dismiss")}</button>
+          </div>
+        )}
+
         {/* live settlement countdown — when locked funds free up */}
         {Number(pending) > 0 && (
           <div className="settle-card">
@@ -267,13 +302,32 @@ export default function Dashboard() {
             {recent.map((tx) => {
               const settled = tx.status === "settled";
               const cancelled = tx.status === "cancelled";
-              const label = settled ? t("dash.received") : cancelled ? t("dash.cancelled") : t("dash.waiting");
+              // "matching" = accepted but still settling (locked ~10 min). Show
+              // this prominently as "Locked (settling)" — the state you asked for.
+              const settling = tx.status === "matching";
+              const usdc = Number(tx.amount) / 1e6;
+              const fiat = rate && country ? usdc * rate.rate : null;
+              const label = settled
+                ? t("dash.received")
+                : cancelled
+                  ? t("dash.cancelled")
+                  : t("dash.lockedSettling");
               return (
                 <div key={tx.orderId} className="recent-row">
-                  <span className={`rr-ico ${settled ? "in" : "pend"}`}><Icon.Down /></span>
+                  <span className={`rr-ico ${settled ? "in" : settling ? "wait" : "pend"}`}>
+                    {cancelled ? <Icon.Back /> : <Icon.Down />}
+                  </span>
                   <div className="rr-mid">
-                    <div className="rr-amt">{settled ? "+ " : ""}{fmtUsdc(tx.amount)} USDC</div>
-                    <div className="rr-sub">Sale · #{tx.orderId} · {timeAgo(tx.createdAt)}</div>
+                    {/* FIAT is the headline (what the shopkeeper thinks in), with the
+                        USDC + order id as the secondary line — matches the requested
+                        "₹3,890 / 42.61 USDC · #333" layout. */}
+                    <div className="rr-amt">
+                      {settled ? "+ " : ""}
+                      {fiat != null ? fmtFiat(country, fiat) : `${fmtUsdc(tx.amount)} USDC`}
+                    </div>
+                    <div className="rr-sub">
+                      {fmtUsdc(tx.amount)} USDC · #{tx.orderId} · {timeAgo(tx.createdAt)}
+                    </div>
                   </div>
                   <span className={`rr-status ${settled ? "ok" : cancelled ? "bad" : "wait"}`}>
                     {label}

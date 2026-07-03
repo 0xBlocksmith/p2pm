@@ -5,12 +5,12 @@ import { usePublicClient } from "wagmi";
 import { useSmartAccount } from "./useSmartAccount";
 
 /**
- * Adapts the merchant's Privy SMART WALLET to the @p2pdotme/widgets
+ * Adapts the merchant's thirdweb SMART ACCOUNT to the @p2pdotme/widgets
  * `CheckoutSigner` interface:
  *   { address, sendTransaction({ to, data, gasLimit }) => { hash } }
  *
- * Transactions are sent as sponsored UserOperations through the smart wallet
- * (gas paid by the Pimlico paymaster), so the merchant needs 0 ETH.
+ * Transactions are sent as sponsored UserOperations through the smart account
+ * (gas paid by the thirdweb paymaster), so the merchant needs 0 ETH.
  *
  * Returns { signer, publicClient, ready }.
  */

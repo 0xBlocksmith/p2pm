@@ -1,6 +1,6 @@
 /**
- * Branded full-screen splash shown while the app initializes (Privy auth init,
- * prefs read, first route). Replaces the bare "Loading…" text so the wait looks
+ * Branded full-screen splash shown while the app initializes (thirdweb wallet
+ * init, prefs read, first route). Replaces the bare "Loading…" text so the wait looks
  * intentional and on-brand — important on iOS where a blank flash reads as slow.
  *
  * Pure markup + CSS (logo image), no JS/state, so it paints as early as

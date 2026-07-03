@@ -49,8 +49,28 @@ export function useSmartAccount() {
         data,
         ...(value ? { value: BigInt(value) } : {}),
       });
-      const { transactionHash } = await twSendTransaction({ account, transaction: tx });
-      return transactionHash as `0x${string}`;
+
+      // The sponsored-tx path calls thirdweb's bundler/paymaster (gas price,
+      // sponsorship, submit). Those endpoints occasionally return a TRANSIENT
+      // infra error — Cloudflare 522/504, a timeout, or a non-JSON body that
+      // surfaces as "Unexpected token 'e'…". Auto-retry a few times with backoff
+      // before failing, so a momentary blip doesn't break registration/withdraw.
+      let lastErr: any;
+      for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+          const { transactionHash } = await twSendTransaction({ account, transaction: tx });
+          return transactionHash as `0x${string}`;
+        } catch (e: any) {
+          lastErr = e;
+          const msg = String(e?.message || e || "");
+          const transient =
+            /5\d\d|522|504|503|429|timed out|timeout|Unexpected token|not valid JSON|fetch failed|Failed to fetch|network|ECONN|socket hang up/i.test(msg);
+          // A user rejection or a real revert is NOT retryable — bail immediately.
+          if (!transient || /reject|revert|denied|insufficient/i.test(msg)) throw e;
+          await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+        }
+      }
+      throw lastErr;
     };
   }, [account]);
 

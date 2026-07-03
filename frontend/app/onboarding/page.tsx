@@ -94,8 +94,15 @@ export default function Onboarding() {
       router.replace("/qr");
     } catch (err) {
       console.error("register failed:", err);
-      const msg = err?.shortMessage || err?.details || err?.message || "Setup failed";
-      setError(msg.includes("User rejected") ? "Cancelled." : `Setup failed: ${msg}`);
+      const raw = String(err?.shortMessage || err?.details || err?.message || "");
+      if (/User rejected|reject|denied/i.test(raw)) {
+        setError("Cancelled.");
+      } else if (/5\d\d|522|504|timed out|timeout|Unexpected token|not valid JSON|network|fetch failed/i.test(raw)) {
+        // Transient thirdweb bundler/paymaster infra error (already auto-retried).
+        setError("Network hiccup reaching the gas-free wallet service. Please tap again in a moment.");
+      } else {
+        setError(`Setup failed: ${raw || "please try again"}`);
+      }
       setBusy(false);
     }
   }

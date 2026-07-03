@@ -73,19 +73,19 @@ const STEPS = [
 ];
 
 const KEY = "payqr.tourDone";
-const NEW_KEY = "payqr.tourPending"; // set at login when Privy says isNewUser
+const NEW_KEY = "payqr.tourPending"; // set at login for a first-time device
 
 export function tourSeen() {
   if (typeof window === "undefined") return true;
   try { return localStorage.getItem(KEY) === "1"; } catch { return true; }
 }
 
-/** Called from login for a brand-new Privy user — force the tour to show
+/** Called from login for a first-time device — force the tour to show
  *  again even if this device saw it before (it's a different person). */
 export function flagNewUser() {
   try { localStorage.setItem(NEW_KEY, "1"); localStorage.removeItem(KEY); } catch {}
 }
-/** Returning Privy user: don't force a re-show, but if they never finished the
+/** Returning user: don't force a re-show, but if they never finished the
  *  tour on this device it can still appear. */
 export function clearTourPending() {
   try { localStorage.setItem(NEW_KEY, "0"); } catch {}
@@ -98,7 +98,7 @@ export function AppTour({ force = false, onClose }) {
   useEffect(() => {
     if (force) { setOpen(true); setI(0); return; }
     // Auto-open for anyone who hasn't completed the tour yet on this device —
-    // this covers brand-new Privy users (flagged at login) and any fresh login
+    // this covers first-time users (flagged at login) and any fresh login
     // where the tour was never finished. Once finished, it won't show again.
     if (!tourSeen()) { setOpen(true); setI(0); }
   }, [force]);

@@ -3,7 +3,8 @@
 import { useState } from "react";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
-import { usePrivy } from "@privy-io/react-auth";
+import { useAuth } from "./useAuth";
+import { clearLocalUserData } from "../lib/countries";
 import { Logo, Icon } from "./Icons";
 import { useT } from "../lib/i18n";
 
@@ -14,9 +15,8 @@ import { useT } from "../lib/i18n";
  */
 export function SideMenu({ open, onClose }: { open: boolean; onClose: () => void }) {
   const router = useRouter();
-  const { user, logout } = usePrivy();
+  const { logout, email } = useAuth();
   const { t } = useT();
-  const email = (user as any)?.email?.address || (user as any)?.google?.email || "";
 
   const items = [
     { href: "/transactions", label: t("nav.transactions"), Ico: Icon.Repeat },
@@ -60,7 +60,7 @@ export function SideMenu({ open, onClose }: { open: boolean; onClose: () => void
           </div>
         )}
 
-        <button className="sm-logout" onClick={() => { onClose(); logout().then(() => router.replace("/login")); }}>
+        <button className="sm-logout" onClick={() => { onClose(); clearLocalUserData(); logout().finally(() => router.replace("/login")); }}>
           <Icon.Back /> {t("nav.logout")}
         </button>
 

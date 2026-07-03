@@ -1,9 +1,10 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
-import { usePrivy } from "@privy-io/react-auth";
 import { useReadContract } from "wagmi";
 import { useSmartAccount } from "./useSmartAccount";
+import { useAuth } from "./useAuth";
+import { clearLocalUserData } from "../lib/countries";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, fmtUsdc } from "../lib/contract";
 
 /**
@@ -11,7 +12,7 @@ import { CONTRACT_ADDRESS, INTEGRATOR_ABI, fmtUsdc } from "../lib/contract";
  * (copy), balance, and logout. Replaces the old Wallet nav tab.
  */
 export function AccountMenu() {
-  const { logout, user } = usePrivy();
+  const { logout, email } = useAuth();
   const { address } = useSmartAccount();
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -34,12 +35,11 @@ export function AccountMenu() {
     return () => document.removeEventListener("mousedown", onDoc);
   }, []);
 
-  const email = user?.email?.address || user?.google?.email || "";
   const initial = (email || "M").slice(0, 1).toUpperCase();
 
   function copy() {
     if (!address) return;
-    navigator.clipboard.writeText(address);
+    navigator.clipboard?.writeText(address);
     setCopied(true);
     setTimeout(() => setCopied(false), 1400);
   }
@@ -78,7 +78,11 @@ export function AccountMenu() {
 
           <a className="acct-menu-link" href="/settings">Settings</a>
 
-          <button className="btn secondary small" style={{ width: "100%" }} onClick={logout}>
+          <button
+            className="btn secondary small"
+            style={{ width: "100%" }}
+            onClick={() => { clearLocalUserData(); logout().finally(() => { window.location.href = "/login"; }); }}
+          >
             Log out
           </button>
         </div>

@@ -2,8 +2,8 @@
 
 import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { usePrivy, useLogin } from "@privy-io/react-auth";
-import { flagNewUser, clearTourPending, AppTour } from "../../components/AppTour";
+import { useAuth } from "../../components/useAuth";
+import { flagNewUser, AppTour } from "../../components/AppTour";
 import { Logo, Icon } from "../../components/Icons";
 import { InstallButton } from "../../components/InstallButton";
 import { ThemeButton } from "../../components/ThemeButton";
@@ -15,7 +15,7 @@ import {
 
 export default function Login() {
   const router = useRouter();
-  const { ready, authenticated } = usePrivy();
+  const { ready, authenticated, login } = useAuth();
   const { t, lang, setLang } = useT();
   const [showTour, setShowTour] = useState(false);
   const [country, setCountry] = useState(COUNTRIES[0]);
@@ -25,16 +25,6 @@ export default function Login() {
   // ISO-2 code per country for real flag images (emoji flags don't render on Windows).
   const CC: Record<string, string> = { india: "in", brazil: "br", argentina: "ar" };
   const flagUrl = (id: string) => `https://flagcdn.com/w40/${CC[id] || "un"}.png`;
-
-  // currency + language chosen here are saved before Privy login, so there's
-  // no separate /select step — login lands straight on the dashboard.
-  const { login } = useLogin({
-    onComplete: ({ isNewUser }) => {
-      if (isNewUser) flagNewUser();
-      else clearTourPending();
-      router.replace("/");
-    },
-  });
 
   // Only bounce an authenticated user off the login page once their prefs are
   // set — otherwise they're here precisely to pick currency/language. Without
@@ -56,15 +46,23 @@ export default function Login() {
     if (ready && !authenticated) setShowTour(true);
   }, [ready, authenticated]);
 
-  function onLogin() {
+  async function onLogin() {
     // persist the picks so the rest of the app is country-aware immediately
     saveCountry(country.id);
     markPrefsSet();
     // Already signed in (e.g. returned here only to pick prefs)? Don't reopen
-    // the Privy modal — just proceed; "/" now routes to the dashboard since
-    // prefs are set. Otherwise start the normal login flow.
-    if (authenticated) router.replace("/");
-    else login();
+    // the connect modal — just proceed; "/" now routes to the dashboard since
+    // prefs are set. Otherwise open the thirdweb connect modal (email/social).
+    if (authenticated) { router.replace("/"); return; }
+    try {
+      await login();
+      // Flag the how-it-works tour for a first-time device (AppTour's own
+      // localStorage gate means a returning user won't re-see it).
+      flagNewUser();
+      router.replace("/");
+    } catch {
+      // User closed the modal / cancelled — stay on the login page.
+    }
   }
 
   return (

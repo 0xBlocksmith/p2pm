@@ -1,9 +1,14 @@
+"use client";
+
+import { useId } from "react";
+
 // PayQR brand logo — rounded-square frame with QR scan-corners and a "P",
 // in the blue→green brand gradient. Inline SVG so it's crisp at any size and
-// needs no asset file. `size` controls the box; gradient id is unique per render.
-let _logoSeq = 0;
+// needs no asset file. `size` controls the box; the gradient id comes from
+// React's useId() so it is STABLE across server + client render (a module-level
+// counter produced different ids on each side → a hydration mismatch warning).
 export function Logo({ size = 28, ...p }) {
-  const gid = `pqr-grad-${++_logoSeq}`;
+  const gid = `pqr-grad-${useId()}`;
   return (
     <svg viewBox="0 0 64 64" width={size} height={size} fill="none" {...p}>
       <defs>

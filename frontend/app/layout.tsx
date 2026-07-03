@@ -13,7 +13,7 @@ const jakarta = Plus_Jakarta_Sans({
 });
 
 export const metadata = {
-  title: "PayQR — Merchant Terminal",
+  title: "PayQR",
   description: "Accept payments, settle in USDC, get paid in your currency",
   manifest: "/manifest.json",
   appleWebApp: { capable: true, statusBarStyle: "default", title: "PayQR" },
@@ -23,7 +23,7 @@ export const metadata = {
 };
 
 export const viewport = {
-  themeColor: "#5b4cf0",
+  themeColor: "#453DEB",
   width: "device-width",
   initialScale: 1,
   maximumScale: 1,
@@ -35,7 +35,7 @@ export default function RootLayout({ children }) {
       <head>
         {/* Preload the splash logo so it paints with zero fetch gap, and warm
             the thirdweb/Alchemy connections so wallet init starts sooner. */}
-        <link rel="preload" as="image" href="/logo-mark.png" />
+        <link rel="preload" as="image" href="/splash.png" />
         <link rel="preconnect" href="https://c.thirdweb.com" crossOrigin="" />
         <link rel="dns-prefetch" href="https://c.thirdweb.com" />
         <link rel="preconnect" href="https://embedded-wallet.thirdweb.com" crossOrigin="" />

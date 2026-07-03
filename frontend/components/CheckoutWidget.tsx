@@ -14,6 +14,9 @@ import { ACTIVE_CHAIN } from "../lib/chain";
  * placeOrder callback that calls OUR integrator's userPlaceOrder.
  *
  * Props:
+ *   orderId     string — when set, the widget skips placeOrder and tracks an
+ *               already-placed order instead (resuming a payment the merchant
+ *               reopened this dialog for)
  *   usdcAmount  bigint (6-dec) — what the merchant is charging
  *   quantity    bigint — product-2 units (USDC cents) for our userPlaceOrder
  *   productName string
@@ -21,6 +24,7 @@ import { ACTIVE_CHAIN } from "../lib/chain";
  *   onClose     () => void
  */
 type CheckoutWidgetProps = {
+  orderId?: string;
   usdcAmount: bigint;
   quantity: bigint;
   productName?: string;
@@ -32,7 +36,7 @@ type CheckoutWidgetProps = {
   onError?: (msg: string) => void;
 };
 
-export function CheckoutWidget({ usdcAmount, quantity, productName, currencies, onPlaced, onComplete, onCancel, onClose, onError }: CheckoutWidgetProps) {
+export function CheckoutWidget({ orderId, usdcAmount, quantity, productName, currencies, onPlaced, onComplete, onCancel, onClose, onError }: CheckoutWidgetProps) {
   const { signer, publicClient, ready } = useCheckoutSigner();
   const { getIdentity } = useRelayIdentity();
   const [err, setErr] = useState("");
@@ -49,6 +53,7 @@ export function CheckoutWidget({ usdcAmount, quantity, productName, currencies, 
       <Checkout
         mode="modal"
         open={true}
+        orderId={orderId}
         signer={signer}
         chainId={ACTIVE_CHAIN.id}
         diamondAddress={(DIAMOND_ADDRESS || undefined) as `0x${string}` | undefined}

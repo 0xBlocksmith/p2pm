@@ -1,35 +1,10 @@
-"use client";
-
-import { useId } from "react";
-
-// PayQR brand logo — rounded-square frame with QR scan-corners and a "P",
-// in the blue→green brand gradient. Inline SVG so it's crisp at any size and
-// needs no asset file. `size` controls the box; the gradient id comes from
-// React's useId() so it is STABLE across server + client render (a module-level
-// counter produced different ids on each side → a hydration mismatch warning).
+// PayQR brand logo — the "qr" mark (same artwork as the splash screen),
+// tightly cropped so it reads clearly at small nav-bar sizes. `size` controls
+// the box; the source file is transparent so it drops onto any background.
 export function Logo({ size = 28, ...p }) {
-  const gid = `pqr-grad-${useId()}`;
   return (
-    <svg viewBox="0 0 64 64" width={size} height={size} fill="none" {...p}>
-      <defs>
-        <linearGradient id={gid} x1="6" y1="58" x2="58" y2="6" gradientUnits="userSpaceOnUse">
-          <stop offset="0" stopColor="#5b4cf0" />
-          <stop offset="1" stopColor="#7a6cff" />
-        </linearGradient>
-      </defs>
-      {/* rounded square frame */}
-      <rect x="5" y="5" width="54" height="54" rx="16" stroke={`url(#${gid})`} strokeWidth="3.5" />
-      {/* scan-frame corners */}
-      <g stroke={`url(#${gid})`} strokeWidth="3" strokeLinecap="round">
-        <path d="M17 23v-4a2 2 0 0 1 2-2h4" />
-        <path d="M47 23v-4a2 2 0 0 0-2-2h-4" />
-        <path d="M17 41v4a2 2 0 0 0 2 2h4" />
-        <path d="M47 41v4a2 2 0 0 1-2 2h-4" />
-      </g>
-      {/* the "P" */}
-      <path d="M26 46V20h9a8 8 0 0 1 0 16h-9" stroke={`url(#${gid})`}
-        strokeWidth="5" strokeLinecap="round" strokeLinejoin="round" />
-    </svg>
+    // eslint-disable-next-line @next/next/no-img-element
+    <img src="/logo-mark.png" alt="" width={size} height={size} {...p} />
   );
 }
 

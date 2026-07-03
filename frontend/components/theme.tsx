@@ -3,9 +3,9 @@
 import { useEffect, useState, createContext, useContext } from "react";
 
 const KEY = "payqr.theme"; // "light" | "dark" | "system"
-// Dark is the default look (matches the p2p.me app). A user's explicit
-// light/system choice is saved to localStorage and still wins.
-const DEFAULT = "dark";
+// Light is the default look. A user's explicit dark/system choice is saved
+// to localStorage and still wins.
+const DEFAULT = "light";
 
 type ThemeValue = {
   theme: string;
@@ -14,7 +14,7 @@ type ThemeValue = {
 };
 const ThemeCtx = createContext<ThemeValue>({
   theme: DEFAULT,
-  resolved: "dark",
+  resolved: DEFAULT,
   setTheme: () => {},
 });
 
@@ -39,7 +39,7 @@ export const themeInitScript = `
 
 export function ThemeProvider({ children }) {
   const [theme, setThemeState] = useState(DEFAULT);
-  const [resolved, setResolved] = useState("dark");
+  const [resolved, setResolved] = useState(DEFAULT);
 
   // Load saved preference on mount.
   useEffect(() => {

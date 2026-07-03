@@ -156,3 +156,38 @@ export function makePlaceOrder({ signer, publicClient, quantity, getIdentity }) 
     return { orderId, txHash: hash };
   };
 }
+
+// ── Pending-order persistence ──────────────────────────────────────
+// A merchant who closes the checkout dialog after the order lands on-chain
+// (but before it completes) would otherwise lose the orderId — the sale sits
+// pending forever with no way to get back to it. We stash the minimal info
+// needed to reopen <Checkout orderId={...}> in tracking-only mode, and clear
+// it once the widget reports the order finished (complete/cancel/error).
+const PENDING_KEY = "payqr.pendingOrder";
+
+export type PendingOrder = {
+  orderId: string;
+  fiat: number;
+  usdc: number;
+  countryId: string;
+  shopLabel: string;
+  savedAt: number;
+};
+
+export function savePendingOrder(order: PendingOrder): void {
+  try { localStorage.setItem(PENDING_KEY, JSON.stringify(order)); } catch {}
+}
+
+export function loadPendingOrder(): PendingOrder | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = localStorage.getItem(PENDING_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+
+export function clearPendingOrder(): void {
+  try { localStorage.removeItem(PENDING_KEY); } catch {}
+}

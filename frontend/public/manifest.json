@@ -1,12 +1,12 @@
 {
-  "name": "PayQR — Merchant Terminal",
+  "name": "PayQR",
   "short_name": "PayQR",
   "description": "Accept payments, settle in USDC, get paid in your currency.",
   "start_url": "/",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#0a0e16",
-  "theme_color": "#5b4cf0",
+  "background_color": "#453DEB",
+  "theme_color": "#453DEB",
   "icons": [
     { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
     { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" }

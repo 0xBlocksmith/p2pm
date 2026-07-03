@@ -11,7 +11,7 @@ export function Splash() {
   return (
     <div className="splash" role="status" aria-label="Loading PayQR">
       {/* eslint-disable-next-line @next/next/no-img-element */}
-      <img className="splash-logo" src="/logo-mark.png" alt="PayQR" width={130} height={130} />
+      <img className="splash-logo" src="/splash.png" alt="PayQR" width={130} height={130} />
       <div className="splash-dots"><i /><i /><i /></div>
     </div>
   );

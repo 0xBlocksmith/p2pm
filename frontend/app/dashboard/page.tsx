@@ -47,7 +47,7 @@ export default function Dashboard() {
 
   // Registration is checked lazily: the dashboard opens for everyone, and we
   // route to /onboarding only when the merchant tries to accept a payment.
-  const { data: isRegistered } = useReadContract({
+  const { data: isRegistered, isLoading: regLoading } = useReadContract({
     address: CONTRACT_ADDRESS,
     abi: INTEGRATOR_ABI,
     functionName: "registered",
@@ -56,6 +56,9 @@ export default function Dashboard() {
   });
 
   function acceptPayment() {
+    // Registration status hasn't loaded yet — don't bounce a registered
+    // merchant to /onboarding just because the read is still in flight.
+    if (!address || regLoading) return;
     router.push(isRegistered ? "/qr" : "/onboarding");
   }
 

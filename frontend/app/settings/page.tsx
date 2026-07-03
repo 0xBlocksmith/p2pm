@@ -133,14 +133,14 @@ export default function Settings() {
             </>
           ) : (
             <>
-          <div className="set-item">
-            <span className="set-k">{t("set.shopName")}</span>
-            <span className="set-v">{shopName || "—"}</span>
-          </div>
-          <div className="set-item">
-            <span className="set-k">{country.payoutLabel}</span>
-            <span className="set-v">{payoutId || "—"}</span>
-          </div>
+              <div className="set-item">
+                <span className="set-k">{t("set.shopName")}</span>
+                <span className="set-v">{shopName || "—"}</span>
+              </div>
+              <div className="set-item">
+                <span className="set-k">{country.payoutLabel}</span>
+                <span className="set-v">{payoutId || "—"}</span>
+              </div>
             </>
           )}
 

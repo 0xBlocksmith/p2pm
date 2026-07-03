@@ -8,7 +8,9 @@ import { useMerchant } from "../../components/useMerchant";
 import { Icon } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, perTxCapUsdc, currencyFromBytes32 } from "../../lib/contract";
 import { fetchUsdcRate } from "../../lib/rates";
-import { loadCountry, fmtFiat, COUNTRIES } from "../../lib/countries";
+import { loadCountry, fmtFiat, COUNTRIES, getCountry } from "../../lib/countries";
+import { loadPendingOrder, savePendingOrder, clearPendingOrder } from "../../lib/p2p";
+import type { PendingOrder } from "../../lib/p2p";
 import { useT } from "../../lib/i18n";
 import dynamic from "next/dynamic";
 
@@ -73,13 +75,15 @@ export default function PosQr() {
   const [liveWidget, setLiveWidget] = useState(null);
   const [done, setDone] = useState(null);
   const [payError, setPayError] = useState("");
-  // A payment session that was started but not finished (widget closed / left).
-  // Persisted so the merchant can RESUME it instead of losing the sale, and can
-  // CANCEL a stuck one. Cleared on complete/cancel. (Bug: closing the p2p dialog
-  // used to orphan the session forever.)
+  // A payment session that was started but not finished (widget closed / left)
+  // BEFORE the order landed on-chain. Persisted so the merchant can RESUME it
+  // instead of losing the sale, and can CANCEL a stuck one. Cleared on
+  // complete/cancel. (Bug: closing the p2p dialog used to orphan the session
+  // forever.)
   const [pendingSession, setPendingSession] = useState(null);
   const SESSION_KEY = "payqr.pendingSession";
   const SESSION_TTL_MS = 15 * 60 * 1000; // 15 min — a stale session auto-expires
+  const [pending, setPending] = useState<PendingOrder | null>(null); // order placed on-chain but never finished
 
   // Default the sale currency to the merchant's registered country.
   useEffect(() => { setCountry(loadCountry()); }, []);
@@ -116,6 +120,11 @@ export default function PosQr() {
       fiat: pendingSession.fiat, usdc: pendingSession.usdc,
     });
   }
+
+  // On mount, check for a payment that was placed on-chain but never finished
+  // (e.g. merchant closed the QR dialog mid-payment) so it can be resumed
+  // instead of silently lost.
+  useEffect(() => { setPending(loadPendingOrder()); }, []);
 
   // Every configured country is selectable as the accept currency. The widget
   // resolves the circle for the picked currency at order time; if the protocol
@@ -221,6 +230,23 @@ export default function PosQr() {
     });
   }
 
+  // Reopen the checkout modal against a previously-placed order (the merchant
+  // closed the dialog before it finished) instead of starting a fresh sale.
+  function resumePending() {
+    if (!pending) return;
+    setError("");
+    setLiveWidget({
+      resumeOrderId: pending.orderId,
+      usdcAmount: BigInt(Math.round(pending.usdc * 1e6)),
+      quantity: 0n, fiat: pending.fiat, usdc: pending.usdc,
+    });
+  }
+
+  function discardPending() {
+    clearPendingOrder();
+    setPending(null);
+  }
+
   // Public, no-auth receipt link the CUSTOMER opens to verify their payment.
   function receiptUrl() {
     if (typeof window === "undefined" || !done) return "";
@@ -252,6 +278,7 @@ export default function PosQr() {
         {liveWidget && (
           <>
             <CheckoutWidget
+              orderId={liveWidget.resumeOrderId}
               usdcAmount={liveWidget.usdcAmount}
               quantity={liveWidget.quantity}
               productName={shopLabel || "PayQR sale"}
@@ -259,23 +286,35 @@ export default function PosQr() {
                 symbol: country.code, flag: country.flag,
                 paymentMethod: country.fiat, symbolNative: country.symbol,
               }]}
+              onPlaced={(orderId) => {
+                savePendingOrder({
+                  orderId: String(orderId), fiat: liveWidget.fiat, usdc: liveWidget.usdc,
+                  countryId: country.id, shopLabel, savedAt: Date.now(),
+                });
+              }}
               onComplete={(orderId) => {
                 paymentFeedback();
+                clearPendingOrder(); setPending(null);
                 setDone({ orderId: String(orderId), usdc: liveWidget.usdc, fiat: liveWidget.fiat });
                 setLiveWidget(null); setAmt(""); clearSession(); refetchDaily();
               }}
-              onCancel={() => { setLiveWidget(null); clearSession(); refetchDaily(); }}
-              // Closing the dialog does NOT discard the session — it stays so the
-              // merchant can resume it from the "pending payment" banner below.
+              onCancel={() => {
+                clearPendingOrder(); setPending(null);
+                setLiveWidget(null); clearSession(); refetchDaily();
+              }}
               onClose={() => setLiveWidget(null)}
-              onError={(m) => { setPayError(m); setLiveWidget(null); }}
+              onError={(m) => {
+                clearPendingOrder(); setPending(null);
+                setPayError(m); setLiveWidget(null);
+              }}
             />
           </>
         )}
 
-        {/* Resume / cancel an unfinished payment (dialog was closed or app left).
+        {/* Resume / cancel an unfinished payment that hasn't reached the chain
+            yet (dialog was closed or app left before the order was placed).
             Fixes the orphaned-session bug + gives a way out of a stuck order. */}
-        {pendingSession && !liveWidget && !done && (
+        {pendingSession && !pending && !liveWidget && !done && (
           <div className="panel" style={{ textAlign: "center" }}>
             <h2>Payment in progress</h2>
             <p className="muted" style={{ margin: "6px 0 12px" }}>
@@ -285,6 +324,22 @@ export default function PosQr() {
             <div style={{ display: "flex", gap: 8 }}>
               <button className="btn" style={{ flex: 1 }} onClick={resumeSession}>Resume payment</button>
               <button className="btn ghost" style={{ flex: 1 }} onClick={clearSession}>Cancel</button>
+            </div>
+          </div>
+        )}
+
+        {/* A payment was placed on-chain but the dialog closed before it
+            finished — offer to pick it back up instead of losing it. */}
+        {pending && !liveWidget && !done && !payError && (
+          <div className="panel" style={{ textAlign: "center" }}>
+            <h2>Unfinished payment</h2>
+            <p className="muted" style={{ margin: "8px 0 4px" }}>
+              A sale for {fmtFiat(getCountry(pending.countryId), pending.fiat)} is still
+              in progress (order #{pending.orderId}).
+            </p>
+            <div className="recv-actions" style={{ marginTop: 14 }}>
+              <button className="btn ghost" onClick={discardPending}>Discard</button>
+              <button className="btn" onClick={resumePending}>Resume</button>
             </div>
           </div>
         )}
@@ -333,7 +388,7 @@ export default function PosQr() {
           </div>
         )}
 
-        {limitReached && !liveWidget && !done && !payError && (
+        {limitReached && !liveWidget && !done && !payError && !pendingSession && !pending && (
           <div className="panel">
             <h2>Daily limit reached ({String(used)}/{String(limit)})</h2>
             <p className="muted">All transactions used for today. Resets at midnight UTC.</p>
@@ -341,7 +396,7 @@ export default function PosQr() {
         )}
 
         {/* Number-pad terminal */}
-        {!limitReached && !liveWidget && !done && !payError && !pendingSession && (
+        {!limitReached && !liveWidget && !done && !payError && !pendingSession && !pending && (
           <div className="terminal">
             {/* charge-currency picker — only shows currencies the protocol can
                 settle (live circles). Lets a merchant accept in any supported

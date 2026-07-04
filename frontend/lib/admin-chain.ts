@@ -26,6 +26,7 @@ export async function adminFreezeAction(
   const fn = action === "freeze" ? "freezeMerchant" : "unfreezeMerchant";
   const client = getAdminWalletClient();
   const hash = await client.writeContract({
+    account: client.account!,
     address: CONTRACT_ADDRESS,
     abi: INTEGRATOR_ABI,
     functionName: fn,

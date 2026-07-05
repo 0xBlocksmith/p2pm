@@ -29,6 +29,10 @@ export const Icon = {
       strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}>
       <path d="M4 20V10M10 20V4M16 20v-7M22 20H2" /></svg>
   ),
+  Close: (p) => (
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+      strokeWidth="2.2" strokeLinecap="round" {...p}><path d="M6 6l12 12M18 6L6 18" /></svg>
+  ),
   Headset: (p) => (
     <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
       strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" {...p}>

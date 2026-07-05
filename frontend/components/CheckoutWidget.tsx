@@ -6,6 +6,7 @@ import { useCheckoutSigner } from "./useCheckoutSigner";
 import { useRelayIdentity } from "./useRelayIdentity";
 import { makePlaceOrder, SUBGRAPH_URL, USDC_ADDRESS, DIAMOND_ADDRESS, CURRENCIES } from "../lib/p2p";
 import { ACTIVE_CHAIN } from "../lib/chain";
+import { Icon } from "./Icons";
 
 /**
  * Live UPI checkout via the official p2p.me widget. The widget generates the
@@ -48,11 +49,15 @@ export function CheckoutWidget({ orderId, usdcAmount, quantity, productName, cur
   const placeOrder = makePlaceOrder({ signer, publicClient, quantity, getIdentity });
 
   return (
-    <>
+    <div className="checkout-fullscreen">
+      {onClose && (
+        <button className="checkout-fullscreen-close" onClick={onClose} aria-label="Close">
+          <Icon.Close />
+        </button>
+      )}
       {err && <p className="error">{err}</p>}
       <Checkout
-        mode="modal"
-        open={true}
+        mode="inline"
         orderId={orderId}
         signer={signer}
         chainId={ACTIVE_CHAIN.id}
@@ -70,6 +75,6 @@ export function CheckoutWidget({ orderId, usdcAmount, quantity, productName, cur
         onError={(e) => { const m = e?.message || String(e); setErr(m); onError?.(m); }}
         onClose={() => onClose?.()}
       />
-    </>
+    </div>
   );
 }

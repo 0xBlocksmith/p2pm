@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams, useSearchParams } from "next/navigation";
 import { createPublicClient, http } from "viem";
-import { fetchOrder } from "../../../lib/history";
+import { fetchOrder, receiptToken } from "../../../lib/history";
 import { fmtUsdc, CONTRACT_ADDRESS, INTEGRATOR_ABI } from "../../../lib/contract";
 import { ACTIVE_CHAIN, RPC_URL } from "../../../lib/chain";
 import { Icon, Logo } from "../../../components/Icons";
@@ -141,10 +141,16 @@ export default function Receipt() {
   // path and lend a real pending receipt forged credibility.
   const txRaw = params.get("tx") || "";
   const txParam = /^0x[0-9a-fA-F]{64}$/.test(txRaw) ? txRaw : "";
+  // Access token: proves the visitor holds the exact link the merchant shared
+  // (derived from orderId + the real tx hash, unguessable before the payment
+  // settles) rather than one who is just enumerating sequential order ids.
+  const accessToken = params.get("token") || "";
 
   const [order, setOrder] = useState(null);
   const [loading, setLoading] = useState(true);
   const [verifiedShop, setVerifiedShop] = useState(""); // real shop name from chain
+  const [imgBusy, setImgBusy] = useState(false);
+  const captureRef = useRef<HTMLDivElement>(null);
   // Ownership gate: null = still checking; then "verified" (chain-confirmed ours),
   // "notOurs" (foreign/random → not found), or "unverified" (couldn't check →
   // refresh). We only render a valid receipt on "verified" — never fail open.
@@ -152,11 +158,16 @@ export default function Receipt() {
 
   useEffect(() => {
     let on = true;
-    if (!safeId) { setLoading(false); setOwnerState("notOurs"); return; }
+    if (!safeId || !accessToken) { setLoading(false); setOwnerState("notOurs"); return; }
     fetchOrder(safeId).then((o: any) => {
       if (!on) return;
       setOrder(o); setLoading(false);
       if (!o) { setOwnerState("notOurs"); return; }
+      // The token can only be recomputed once the order has a real on-chain
+      // tx hash. No hash yet (still matching) → can't confirm the visitor
+      // holds a valid link; ask them to wait rather than fail open.
+      if (!o.txHash) { setOwnerState("unverified"); return; }
+      if (receiptToken(safeId, o.txHash) !== accessToken) { setOwnerState("notOurs"); return; }
       if (!o.userAddress) { setOwnerState("unverified"); return; }
       // Verify on-chain that this order belongs to one of OUR registered
       // merchants BEFORE showing it as a valid receipt.
@@ -167,7 +178,7 @@ export default function Receipt() {
       });
     });
     return () => { on = false; };
-  }, [safeId]);
+  }, [safeId, accessToken]);
 
   // The trustworthy shop name comes ONLY from the chain (verifiedShop). The URL
   // ?shop= hint is shown just as a fallback label AND only on a verified receipt —
@@ -183,9 +194,40 @@ export default function Receipt() {
   const cancelled = order?.status === "cancelled";
   const txHash = order?.txHash || txParam;
 
+  // Render the receipt card to a PNG and hand it to the OS share sheet (or
+  // download it, if sharing files isn't supported) — so the customer can save
+  // or forward proof of payment as an image instead of just a link.
+  async function shareAsImage() {
+    if (!captureRef.current || imgBusy) return;
+    setImgBusy(true);
+    try {
+      const { default: html2canvas } = await import("html2canvas");
+      const canvas = await html2canvas(captureRef.current, {
+        backgroundColor: getComputedStyle(captureRef.current).backgroundColor || "#ffffff",
+        scale: Math.min(window.devicePixelRatio || 2, 3),
+      });
+      const blob: Blob | null = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (!blob) return;
+      const file = new File([blob], `payqr-receipt-${order.orderId}.png`, { type: "image/png" });
+      if (navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: "PayQR receipt" });
+      } else {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = file.name;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+      }
+    } catch {
+      // Best-effort — leave the customer with the on-screen receipt if it fails.
+    } finally {
+      setImgBusy(false);
+    }
+  }
+
   return (
     <div className="rcpt-screen">
-      <div className="rcpt-card">
+      <div className="rcpt-card" ref={captureRef}>
         <div className="brand rcpt-brand">
           <Logo size={24} className="brand-mark" /> PayQR
         </div>
@@ -280,6 +322,11 @@ export default function Receipt() {
           </>
         )}
       </div>
+      {order && !notOurs && !unverified && !loading && !verifying && (
+        <button className="btn ghost rcpt-share-img" onClick={shareAsImage} disabled={imgBusy}>
+          <Icon.Share width="15" height="15" /> {imgBusy ? "Preparing image…" : "Share as image"}
+        </button>
+      )}
     </div>
   );
 }

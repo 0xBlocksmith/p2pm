@@ -12,6 +12,7 @@
     "@p2pdotme/sdk": "^1.2.0",
     "@p2pdotme/widgets": "^1.4.0",
     "@tanstack/react-query": "^5.51.0",
+    "html2canvas": "^1.4.1",
     "next": "14.2.15",
     "qrcode.react": "^4.0.1",
     "react": "18.3.1",

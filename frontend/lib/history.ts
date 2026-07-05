@@ -3,6 +3,7 @@
 // by this merchant (userAddress). Balances/locks still come live from the
 // contract; this is purely the historical list for the Transactions page.
 
+import { keccak256, stringToBytes } from "viem";
 import { SUBGRAPH_URL } from "./p2p";
 
 const ST = { 0: "matching", 1: "matching", 2: "matching", 3: "settled", 4: "cancelled" };
@@ -159,4 +160,17 @@ export async function fetchOrder(orderId) {
     placedAt: Number(o.placedAt),
     completedAt: o.completedAt ? Number(o.completedAt) : null,
   };
+}
+
+/**
+ * Receipt link access token — there's no backend to hold a signing secret, so
+ * instead of a real signature we derive the token from the order's on-chain
+ * tx hash, which is unpredictable until the payment actually settles. A link
+ * minted before the real payment lands can't guess it; the receipt page
+ * recomputes this from the SAME chain data it already fetches and rejects a
+ * mismatch. Not cryptographically unforgeable (no secret key), but enough to
+ * stop someone from browsing to a link for /receipt/<other-order-id>.
+ */
+export function receiptToken(orderId: string, txHash: string): string {
+  return keccak256(stringToBytes(`${orderId}:${txHash.toLowerCase()}`)).slice(2, 18);
 }

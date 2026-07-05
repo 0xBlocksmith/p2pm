@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useReadContract } from "wagmi";
 import { Nav } from "../../components/Nav";
@@ -10,6 +10,7 @@ import { CONTRACT_ADDRESS, INTEGRATOR_ABI, perTxCapUsdc, currencyFromBytes32 } f
 import { fetchUsdcRate } from "../../lib/rates";
 import { loadCountry, fmtFiat, COUNTRIES, getCountry } from "../../lib/countries";
 import { loadPendingOrder, savePendingOrder, clearPendingOrder } from "../../lib/p2p";
+import { fetchOrder, receiptToken } from "../../lib/history";
 import type { PendingOrder } from "../../lib/p2p";
 import { useT } from "../../lib/i18n";
 import dynamic from "next/dynamic";
@@ -75,6 +76,8 @@ export default function PosQr() {
   const [liveWidget, setLiveWidget] = useState(null);
   const [done, setDone] = useState(null);
   const [payError, setPayError] = useState("");
+  const [imgBusy, setImgBusy] = useState(false);
+  const captureRef = useRef<HTMLDivElement>(null);
   // A payment session that was started but not finished (widget closed / left)
   // BEFORE the order landed on-chain. Persisted so the merchant can RESUME it
   // instead of losing the sale, and can CANCEL a stuck one. Cleared on
@@ -247,23 +250,48 @@ export default function PosQr() {
     setPending(null);
   }
 
-  // Public, no-auth receipt link the CUSTOMER opens to verify their payment.
+  // Public, no-auth-but-tokened receipt link the CUSTOMER opens to verify
+  // their payment. Only holders of this exact link (with its token) can view
+  // the receipt — see receiptToken() in lib/history.ts.
   function receiptUrl() {
-    if (typeof window === "undefined" || !done) return "";
+    if (typeof window === "undefined" || !done || !done.token) return "";
     const q = new URLSearchParams({
       shop: shopLabel || "My Shop",
       fiat: fmtFiat(country, done.fiat),
+      token: done.token,
     });
     return `${window.location.origin}/receipt/${done.orderId}?${q.toString()}`;
   }
 
-  function shareReceipt() {
-    const url = receiptUrl();
-    const text =
-      `PayQR receipt — ${shopLabel || "My Shop"}\n` +
-      `${fmtFiat(country, done.fiat)} received. Verify your payment:`;
-    if (navigator.share) navigator.share({ title: "PayQR receipt", text, url }).catch(() => {});
-    else navigator.clipboard?.writeText(`${text}\n${url}`);
+  // Render the confirmation card to a PNG and hand it to the OS share sheet
+  // (or download it, if sharing files isn't supported) — so the merchant can
+  // forward proof of payment as an image instead of just a link.
+  async function shareReceipt() {
+    if (!captureRef.current || imgBusy || !done) return;
+    setImgBusy(true);
+    try {
+      const { default: html2canvas } = await import("html2canvas");
+      const canvas = await html2canvas(captureRef.current, {
+        backgroundColor: getComputedStyle(captureRef.current).backgroundColor || "#ffffff",
+        scale: Math.min(window.devicePixelRatio || 2, 3),
+      });
+      const blob: Blob | null = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (!blob) return;
+      const file = new File([blob], `payqr-receipt-${done.orderId}.png`, { type: "image/png" });
+      if (navigator.canShare?.({ files: [file] })) {
+        await navigator.share({ files: [file], title: "PayQR receipt" });
+      } else {
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url; a.download = file.name;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+      }
+    } catch {
+      // Best-effort — leave the merchant with the on-screen confirmation if it fails.
+    } finally {
+      setImgBusy(false);
+    }
   }
 
   if (!country) return <><Nav back /><div className="screen"><p className="muted" style={{ textAlign: "center" }}>Loading…</p></div></>;
@@ -295,8 +323,22 @@ export default function PosQr() {
               onComplete={(orderId) => {
                 paymentFeedback();
                 clearPendingOrder(); setPending(null);
-                setDone({ orderId: String(orderId), usdc: liveWidget.usdc, fiat: liveWidget.fiat });
+                const id = String(orderId);
+                setDone({ orderId: id, usdc: liveWidget.usdc, fiat: liveWidget.fiat, token: "" });
                 setLiveWidget(null); setAmt(""); clearSession(); refetchDaily();
+                // The receipt link's access token needs this order's real tx hash.
+                // The subgraph indexes it moments after settlement, so poll briefly
+                // rather than leaving the share link without a token.
+                (async () => {
+                  for (let i = 0; i < 8; i++) {
+                    const o: any = await fetchOrder(id);
+                    if (o?.txHash) {
+                      setDone((d: any) => (d && d.orderId === id ? { ...d, token: receiptToken(id, o.txHash) } : d));
+                      return;
+                    }
+                    await new Promise((r) => setTimeout(r, 1500));
+                  }
+                })();
               }}
               onCancel={() => {
                 clearPendingOrder(); setPending(null);
@@ -363,26 +405,34 @@ export default function PosQr() {
         {/* You received USDC — confirmation */}
         {done && (
           <div className="received">
-            <div className="tick-wrap"><Icon.Check /></div>
-            <div className="recv-h">{t("qr.received")}<br />${done.usdc.toFixed(2)} USDC</div>
-            <p className="muted recv-sub">
-              Settled on-chain · paid by customer ({fmtFiat(country, done.fiat)}).
-              Withdraw to your bank or keep as USDC.
-            </p>
-            <div className="proofcard">
-              <div className="prow"><span className="k">Order</span><span className="v">#{done.orderId}</span></div>
-              <div className="prow"><span className="k">Received</span><span className="v">{done.usdc.toFixed(2)} USDC</span></div>
-              <div className="prow">
-                <span className="k">Proof</span>
-                <a className="v link" target="_blank" rel="noopener noreferrer"
-                   href={`${SCAN}/address/${INTEGRATOR}`}>Basescan ↗</a>
+            <div ref={captureRef}>
+              <div className="tick-wrap"><Icon.Check /></div>
+              <div className="recv-h">{t("qr.received")}<br />${done.usdc.toFixed(2)} USDC</div>
+              <p className="muted recv-sub">
+                Settled on-chain · paid by customer ({fmtFiat(country, done.fiat)}).
+                Withdraw to your bank or keep as USDC.
+              </p>
+              <div className="proofcard">
+                <div className="prow"><span className="k">Order</span><span className="v">#{done.orderId}</span></div>
+                <div className="prow"><span className="k">Received</span><span className="v">{done.usdc.toFixed(2)} USDC</span></div>
+                <div className="prow">
+                  <span className="k">Proof</span>
+                  <a className="v link" target="_blank" rel="noopener noreferrer"
+                     href={`${SCAN}/address/${INTEGRATOR}`}>Basescan ↗</a>
+                </div>
               </div>
             </div>
-            <a className="recv-receipt-link" href={receiptUrl()} target="_blank" rel="noopener noreferrer">
-              <Icon.Receipt width="15" height="15" /> {t("qr.showReceipt")}
-            </a>
+            {done.token ? (
+              <a className="recv-receipt-link" href={receiptUrl()} target="_blank" rel="noopener noreferrer">
+                <Icon.Receipt width="15" height="15" /> {t("qr.showReceipt")}
+              </a>
+            ) : (
+              <p className="muted tiny" style={{ margin: "6px 0" }}>Preparing receipt link…</p>
+            )}
             <div className="recv-actions">
-              <button className="btn ghost" onClick={shareReceipt}><Icon.Share /> {t("qr.sendReceipt")}</button>
+              <button className="btn ghost" onClick={shareReceipt} disabled={imgBusy}>
+                <Icon.Share /> {imgBusy ? "Preparing image…" : t("qr.sendReceipt")}
+              </button>
               <button className="btn" onClick={() => setDone(null)}><Icon.Plus /> {t("qr.next")}</button>
             </div>
           </div>

@@ -21,7 +21,7 @@ export function SideMenu({ open, onClose }: { open: boolean; onClose: () => void
   const items = [
     { href: "/transactions", label: t("nav.transactions"), Ico: Icon.Repeat },
     { href: "/withdraw", label: t("nav.withdraw"), Ico: Icon.Up },
-    { href: "mailto:support@payqr.app", label: t("nav.help"), Ico: Icon.Headset, ext: true },
+    { href: "https://t.me/PayQRdotPRO", label: t("nav.help"), Ico: Icon.Headset, ext: true },
     { href: "/settings", label: t("nav.settings"), Ico: Icon.Gear },
   ];
 
@@ -37,7 +37,7 @@ export function SideMenu({ open, onClose }: { open: boolean; onClose: () => void
         <nav className="sm-list">
           {items.map((it) =>
             it.ext ? (
-              <a key={it.label} className="sm-row" href={it.href} onClick={onClose}>
+              <a key={it.label} className="sm-row" href={it.href} target="_blank" rel="noopener noreferrer" onClick={onClose}>
                 <span className="sm-ico"><it.Ico /></span><span>{it.label}</span>
                 <span className="sm-arrow">›</span>
               </a>

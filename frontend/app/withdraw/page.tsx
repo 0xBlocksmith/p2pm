@@ -6,8 +6,10 @@ import { encodeFunctionData } from "viem";
 import { useReadContract, usePublicClient } from "wagmi";
 import { Nav } from "../../components/Nav";
 import { useMerchant } from "../../components/useMerchant";
+import { useRelayIdentity } from "../../components/useRelayIdentity";
 import { Icon } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, fmtUsdc, currencyFromBytes32, friendlyError } from "../../lib/contract";
+import { encryptPayout, decryptPayout } from "../../lib/payoutCrypto";
 import { fetchUsdcRate } from "../../lib/rates";
 import { loadCountry, fmtFiat, COUNTRIES } from "../../lib/countries";
 import { buildUsdcWithdraw } from "../../lib/withdraw";
@@ -33,6 +35,7 @@ function fmtRemaining(secs) {
 
 export default function Withdraw() {
   const { ready, address, sendTransaction } = useMerchant();
+  const { getIdentity } = useRelayIdentity();
   const publicClient = usePublicClient();
   const { t } = useT();
 
@@ -98,15 +101,32 @@ export default function Withdraw() {
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "proxyAddress",
     args: [address], query: { enabled: !!address && inFlight > 0 },
   });
-  // Is the connected wallet the contract OWNER? Only the owner can run the admin
+  // Is the connected wallet a contract OWNER? Only an owner can run the admin
   // recovery (freeze → adminAbort → unfreeze) that frees an order the LP left
-  // stuck at "matching" (which reconcileWithdrawal alone can't).
-  const { data: ownerAddr } = useReadContract({
-    address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "owner",
-    query: { enabled: inFlight > 0 },
+  // stuck at "matching" (which reconcileWithdrawal alone can't). The contract is
+  // MULTI-OWNER (no owner() getter) — check membership via isOwner(address).
+  const { data: ownerFlag } = useReadContract({
+    address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "isOwner",
+    args: [address as `0x${string}`], query: { enabled: !!address && inFlight > 0 },
   });
-  const isOwner = !!address && !!ownerAddr && (address as string).toLowerCase() === (ownerAddr as string).toLowerCase();
-  const savedPayout = info?.[0] || "";
+  const isOwner = !!ownerFlag;
+  // info[0] is now the ENCRYPTED payout blob — decrypt it client-side for the
+  // "use saved" option. null when not decryptable on this device (different relay
+  // key); we then only offer "enter a new one".
+  const encSaved = (info?.[0] as string) || "";
+  const [savedPayout, setSavedPayout] = useState("");
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (!encSaved || encSaved === "0x") { if (alive) setSavedPayout(""); return; }
+      try {
+        const id = await getIdentity();
+        const plain = await decryptPayout(encSaved, id);
+        if (alive) setSavedPayout(plain || "");
+      } catch { if (alive) setSavedPayout(""); }
+    })();
+    return () => { alive = false; };
+  }, [encSaved, getIdentity]);
 
   async function sendAndWait(functionName: string, args: any[]) {
     const data = encodeFunctionData({ abi: INTEGRATOR_ABI, functionName, args } as any);
@@ -211,25 +231,39 @@ export default function Withdraw() {
     const useExactMax = isMax || sendUsdc >= availNum;
     const raw = useExactMax ? (available as bigint) : BigInt(Math.round(sendUsdc * 1e6));
 
-    // FIAT: hand off to the official Cashout widget. It collects/encrypts the
-    // payout and runs the full offramp lifecycle. Before opening it, we let the
-    // merchant confirm which payout handle to use (saved or a new one) — if they
-    // chose a NEW one we persist it on-chain via updateProfile so the widget
-    // picks it up. (The widget itself is what actually encrypts + delivers it.)
+    // FIAT: hand off to the official Cashout widget. It collects + encrypts the
+    // payout FRESH in its own UI and runs the full offramp lifecycle — it does
+    // NOT read our on-chain handle. So persisting a "new" default handle here is
+    // a pure convenience (updates the merchant's saved default for next time); it
+    // must NEVER block the withdraw. We validate it, then save BEST-EFFORT.
     if (kind === "fiat") {
-      // If the merchant picked "new" and typed a handle, save it on-chain first.
+      // If the merchant picked "new" and typed a handle, validate + save it as
+      // their default (encrypted client-side — the raw handle never goes on-chain).
+      // A failed/reverted save is non-fatal: we still open the widget.
       if (payoutChoice === "new" && newPayout.trim() && newPayout.trim() !== savedPayout) {
-        setBusy("fiat");
-        try {
-          const data = encodeFunctionData({
-            abi: INTEGRATOR_ABI, functionName: "updateProfile",
-            args: [newPayout.trim(), info?.[1] || "Shop"],
-          });
-          const hash = await sendTransaction({ to: CONTRACT_ADDRESS, data });
-          const rc = await publicClient.waitForTransactionReceipt({ hash });
-          if (rc.status === "reverted") throw new Error("Couldn't save the new payout id.");
-        } catch (err) {
-          setBusy(""); return setError(friendlyError(err, "Couldn't save your payout ID."));
+        // Validate on plaintext, same guard as onboarding/settings.
+        if (wdCountry?.validatePayout && !wdCountry.validatePayout(newPayout.trim())) {
+          return setError(`Enter a valid ${wdCountry.payoutLabel} (like ${wdCountry.payoutPlaceholder}).`);
+        }
+        // Only touch shopName if we actually have it loaded, so we never clobber
+        // the real name with a placeholder.
+        const currentShop = (info?.[1] as string) || "";
+        if (currentShop) {
+          setBusy("fiat");
+          try {
+            const identity = await getIdentity();
+            const encNew = await encryptPayout(newPayout.trim(), identity);
+            const data = encodeFunctionData({
+              abi: INTEGRATOR_ABI, functionName: "updateProfile",
+              args: [encNew, currentShop],
+            });
+            const hash = await sendTransaction({ to: CONTRACT_ADDRESS, data });
+            await publicClient.waitForTransactionReceipt({ hash });
+            // Best-effort: even if it reverted, fall through to the widget — the
+            // widget collects the payout itself and doesn't need the saved copy.
+          } catch {
+            /* non-fatal — saving the default handle is optional; proceed to cash out */
+          }
         }
         setBusy("");
       }

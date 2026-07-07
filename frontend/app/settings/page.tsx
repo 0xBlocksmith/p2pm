@@ -8,8 +8,10 @@ import { encodeFunctionData } from "viem";
 import { Nav } from "../../components/Nav";
 import { useMerchant } from "../../components/useMerchant";
 import { useSmartAccount } from "../../components/useSmartAccount";
+import { useRelayIdentity } from "../../components/useRelayIdentity";
 import { Icon } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI } from "../../lib/contract";
+import { encryptPayout, decryptPayout } from "../../lib/payoutCrypto";
 import {
   COUNTRIES, LANGUAGES, loadCountry, loadLang, saveCountry, saveLang, clearLocalUserData,
 } from "../../lib/countries";
@@ -29,6 +31,7 @@ export default function Settings() {
   const { logout, email } = useAuth();
   useMerchant(); // page guard (auth + prefs)
   const { address, sendTransaction } = useSmartAccount(); // same source the account menu uses
+  const { getIdentity } = useRelayIdentity();
   const publicClient = usePublicClient();
   const { theme, setTheme } = useTheme();
   const { t, lang, setLang } = useT();
@@ -41,8 +44,25 @@ export default function Settings() {
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "getMerchantInfo",
     args: [address], query: { enabled: !!address },
   });
-  const payoutId = info?.[0] || "";
+  const encPayout = info?.[0] || "";   // on-chain ciphertext blob (bytes)
   const shopName = info?.[1] || "";
+
+  // Decrypt the payout handle for display (client-side, with the merchant's own
+  // relay key). null when it can't be decrypted on this device (a different relay
+  // key, e.g. after logout/new device) — we then show a neutral "saved" label.
+  const [payoutId, setPayoutId] = useState<string | null>(null);
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (!encPayout || encPayout === "0x") { if (alive) setPayoutId(null); return; }
+      try {
+        const id = await getIdentity();
+        const plain = await decryptPayout(encPayout as string, id);
+        if (alive) setPayoutId(plain);
+      } catch { if (alive) setPayoutId(null); }
+    })();
+    return () => { alive = false; };
+  }, [encPayout, getIdentity]);
 
   // ── Edit profile (shop name + payout handle) via updateProfile ──
   const [editing, setEditing] = useState(false);
@@ -52,7 +72,7 @@ export default function Settings() {
   const [profileMsg, setProfileMsg] = useState("");
 
   function startEdit() {
-    setEdShop(shopName); setEdPayout(payoutId); setProfileMsg(""); setEditing(true);
+    setEdShop(shopName); setEdPayout(payoutId || ""); setProfileMsg(""); setEditing(true);
   }
   async function saveProfile() {
     setProfileMsg("");
@@ -64,9 +84,12 @@ export default function Settings() {
     if (!sendTransaction) return setProfileMsg("Wallet still connecting — try again in a moment.");
     setSavingProfile(true);
     try {
+      // Encrypt the new handle client-side before it goes on-chain (PII).
+      const identity = await getIdentity();
+      const encNew = await encryptPayout(edPayout.trim(), identity);
       const data = encodeFunctionData({
         abi: INTEGRATOR_ABI, functionName: "updateProfile",
-        args: [edPayout.trim(), edShop.trim()],
+        args: [encNew, edShop.trim()],
       });
       const hash = await sendTransaction({ to: CONTRACT_ADDRESS, data });
       const receipt = await publicClient.waitForTransactionReceipt({ hash });
@@ -139,7 +162,12 @@ export default function Settings() {
           </div>
           <div className="set-item">
             <span className="set-k">{country.payoutLabel}</span>
-            <span className="set-v">{payoutId || "—"}</span>
+            {/* payoutId is decrypted client-side. null + a saved blob = "on file"
+                but not decryptable on this device (different relay key); null + no
+                blob = none set. */}
+            <span className="set-v">
+              {payoutId || (encPayout && encPayout !== "0x" ? "•••• (saved)" : "—")}
+            </span>
           </div>
             </>
           )}

@@ -5,8 +5,10 @@ import { useRouter } from "next/navigation";
 import { usePublicClient } from "wagmi";
 import { encodeFunctionData } from "viem";
 import { useMerchant } from "../../components/useMerchant";
+import { useRelayIdentity } from "../../components/useRelayIdentity";
 import { Logo } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI } from "../../lib/contract";
+import { encryptPayout } from "../../lib/payoutCrypto";
 import { loadCountry, prefsSet } from "../../lib/countries";
 
 /**
@@ -20,6 +22,7 @@ export default function Onboarding() {
   const { ready, address, isRegistered, sendTransaction, refetchRegistered } = useMerchant({
     requireRegistered: false,
   });
+  const { getIdentity } = useRelayIdentity();
   const publicClient = usePublicClient();
 
   const [country, setCountry] = useState(null);
@@ -66,12 +69,18 @@ export default function Onboarding() {
         return setError("Your gas-free wallet is still connecting. Wait a moment and try again.");
       }
 
+      // Encrypt the payout handle CLIENT-SIDE to the merchant's own relay key —
+      // the raw UPI/PIX id must never go on-chain in plaintext (it's PII). The
+      // contract stores the opaque ciphertext blob.
+      const identity = await getIdentity();
+      const encPayout = await encryptPayout(payoutId.trim(), identity);
+
       // The new contract locks the offramp currency at registration, so we pass
       // the chosen country's ISO code (e.g. "INR"/"BRL"/"ARS") as the 3rd arg.
       const data = encodeFunctionData({
         abi: INTEGRATOR_ABI,
         functionName: "registerMerchant",
-        args: [payoutId.trim(), shopName.trim(), country.code],
+        args: [encPayout, shopName.trim(), country.code],
       });
       const hash = await send({ to: CONTRACT_ADDRESS, data });
 

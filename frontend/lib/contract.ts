@@ -13,9 +13,12 @@ export const CLIENT_ADDRESS = process.env.NEXT_PUBLIC_CLIENT_ADDRESS as `0x${str
 // it BEFORE shipping this frontend — these signatures will revert on the old
 // INR-only contract.
 export const INTEGRATOR_ABI = parseAbi([
-  "function registerMerchant(string payoutId, string shopName, string currencyCode)",
-  "function registerMerchantRaw(string payoutId, string shopName, bytes32 currency)",
-  "function updateProfile(string payoutId, string shopName)",
+  // payoutId is now an ENCRYPTED bytes blob (client-side encrypted to the
+  // merchant's relay key — see lib/payoutCrypto.ts). The raw UPI/PIX handle is
+  // never on-chain in plaintext. Pass encrypted bytes here, not a string.
+  "function registerMerchant(bytes encPayoutId, string shopName, string currencyCode)",
+  "function registerMerchantRaw(bytes encPayoutId, string shopName, bytes32 currency)",
+  "function updateProfile(bytes encPayoutId, string shopName)",
   "function registered(address) view returns (bool)",
   "function userPlaceOrder(address client, uint256 productId, uint256 quantity, bytes32 currency, uint256 circleId, string pubKey) returns (uint256)",
   "function withdrawFiat(uint256 amount, uint256 circleId, string pubKey, string payoutOverride) returns (uint256)",
@@ -24,7 +27,7 @@ export const INTEGRATOR_ABI = parseAbi([
   "function reconcileWithdrawal(uint256 orderId)",
   "function withdrawUSDC(uint256 amount)",
   "function getMerchantBalance(address merchant) view returns (uint256 pending, uint256 available, uint256 totalDeposited, bool isFrozen)",
-  "function getMerchantInfo(address merchant) view returns (string payoutId, string shopName, bytes32 currency, bool isRegistered, bool isFrozen)",
+  "function getMerchantInfo(address merchant) view returns (bytes encPayoutId, string shopName, bytes32 currency, bool isRegistered, bool isFrozen)",
   "function getMerchantBuckets(address merchant) view returns ((uint256 amount, uint256 unlockTimestamp)[])",
   "function getDailyTxInfo(address merchant) view returns (uint256 usedToday, uint256 limit)",
   "function getMerchantCurrency(address merchant) view returns (string)",
@@ -34,14 +37,17 @@ export const INTEGRATOR_ABI = parseAbi([
   "function setDailyLimit(uint256 newLimit)",
   "function freezeMerchant(address merchant)",
   "function unfreezeMerchant(address merchant)",
-  "function owner() view returns (address)",
+  // MULTI-OWNER: there is NO owner() — ownership is a set. Check membership with
+  // isOwner(address) (the public mapping getter); ownerCount() is the size.
+  "function isOwner(address) view returns (bool)",
+  "function ownerCount() view returns (uint256)",
   "function admins(address) view returns (bool)",
   "function isAdmin(address who) view returns (bool)",
   // Role-based access control, 5 HIERARCHICAL tiers (0=NONE, 1=VIEWER, 2=SUPPORT,
   // 3=MANAGER, 4=FINANCE): VIEWER=read-only, SUPPORT=+freeze/unfreeze,
-  // MANAGER=+caps/limits/relayer, FINANCE=+recover stuck withdrawals. Owner is
-  // above all (reads as 4) and is the ONLY one who can assign roles / transfer
-  // ownership — gate owner-only UI on owner()==addr, NOT roleOf==4.
+  // MANAGER=+caps/limits/relayer, FINANCE=+recover stuck withdrawals. Every OWNER
+  // is above all tiers (reads as 4) — gate owner-only UI on isOwner(addr), NOT
+  // roleOf==4 (a Finance admin also reads 4 but is not an owner).
   "function adminRole(address) view returns (uint8)",
   "function roleOf(address who) view returns (uint8)",
   "function isManager(address who) view returns (bool)",
@@ -62,7 +68,7 @@ export const INTEGRATOR_ABI = parseAbi([
   // this returns the scalar fields in order; index 8 is inFlightWithdrawals (the
   // count of unsettled SELL withdrawals — a new fiat withdraw reverts
   // WithdrawalInFlight while this is > 0). Used to warn + offer recovery.
-  "function merchants(address) view returns (address merchantAddr, string payoutId, string shopName, bytes32 currency, uint256 totalDeposited, bool isFrozen, uint256 dailyTxCount, uint256 lastTxDate, uint256 inFlightWithdrawals)",
+  "function merchants(address) view returns (address merchantAddr, bytes encPayoutId, string shopName, bytes32 currency, uint256 totalDeposited, bool isFrozen, uint256 dailyTxCount, uint256 lastTxDate, uint256 inFlightWithdrawals)",
   // proxy => the merchant EOA it was deployed for. Used by the public receipt to
   // resolve a SELL/withdrawal order's placer (a per-merchant proxy) back to the
   // registered merchant. MUST be present or the receipt ownership check throws

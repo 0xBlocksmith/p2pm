@@ -1,5 +1,6 @@
 "use client";
 
+import { useCallback } from "react";
 import { useSmartAccount } from "./useSmartAccount";
 
 /**
@@ -21,7 +22,10 @@ const KEY_PREFIX = "payqr.relay:"; // + lowercased smart-account address
 export function useRelayIdentity() {
   const { address } = useSmartAccount();
 
-  async function getIdentity() {
+  // Memoized on `address` so consumers can safely use it in a useEffect dep array
+  // without the effect re-firing every render (which would re-import the SDK and
+  // re-decrypt the saved payout on every 1s ticker tick — see settings/withdraw).
+  const getIdentity = useCallback(async () => {
     if (!address) throw new Error("Wallet not connected — cannot create a relay identity.");
     const { createRelayIdentity } = await import("@p2pdotme/sdk/orders");
     const storeKey = KEY_PREFIX + address.toLowerCase();
@@ -39,7 +43,7 @@ export function useRelayIdentity() {
       try { localStorage.setItem(storeKey, JSON.stringify(identity)); } catch {}
     }
     return identity;
-  }
+  }, [address]);
 
   return { getIdentity };
 }

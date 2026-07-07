@@ -8,6 +8,7 @@ import { Nav } from "../../components/Nav";
 import { useMerchant } from "../../components/useMerchant";
 import { Icon } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, fmtUsdc, currencyFromBytes32, friendlyError } from "../../lib/contract";
+import { STATIC_STALE_MS } from "../../lib/cache";
 import { fetchUsdcRate } from "../../lib/rates";
 import { loadCountry, fmtFiat, COUNTRIES } from "../../lib/countries";
 import { buildUsdcWithdraw } from "../../lib/withdraw";
@@ -84,7 +85,7 @@ export default function Withdraw() {
   });
   const { data: info } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "getMerchantInfo",
-    args: [address], query: { enabled: !!address },
+    args: [address], query: { enabled: !!address, staleTime: STATIC_STALE_MS },
   });
   // Read the merchant struct to detect an IN-FLIGHT fiat withdrawal (index 8).
   // A new fiat withdraw reverts WithdrawalInFlight while this is > 0, so we warn
@@ -96,14 +97,14 @@ export default function Withdraw() {
   const inFlight = mstruct ? Number((mstruct as any)[8]) : 0;
   const { data: proxyAddr } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "proxyAddress",
-    args: [address], query: { enabled: !!address && inFlight > 0 },
+    args: [address], query: { enabled: !!address && inFlight > 0, staleTime: STATIC_STALE_MS },
   });
   // Is the connected wallet the contract OWNER? Only the owner can run the admin
   // recovery (freeze → adminAbort → unfreeze) that frees an order the LP left
   // stuck at "matching" (which reconcileWithdrawal alone can't).
   const { data: ownerAddr } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "owner",
-    query: { enabled: inFlight > 0 },
+    query: { enabled: inFlight > 0, staleTime: STATIC_STALE_MS },
   });
   const isOwner = !!address && !!ownerAddr && (address as string).toLowerCase() === (ownerAddr as string).toLowerCase();
   const savedPayout = info?.[0] || "";
@@ -170,8 +171,22 @@ export default function Withdraw() {
   // from it, not from the freely-editable UI country preference.
   const registeredCode = currencyFromBytes32(info?.[2] as string);
   const [pending, available] = balance ?? [0n, 0n];
-  const availNum = Number(available) / 1e6;               // available in USDC
-  const availFiat = rate ? availNum * rate.rate : null;   // available in local fiat
+  const availNum = Number(available) / 1e6;               // withdrawable (unlocked) USDC
+  const availFiat = rate ? availNum * rate.rate : null;   // withdrawable in local fiat
+  // ACCOUNT BALANCE = everything the contract holds for this merchant, matured
+  // or not (pending = still-locked buckets + available = unlocked). NOT
+  // totalDeposited, which is a lifetime counter that never decreases.
+  const pendingNum = Number(pending) / 1e6;
+  const accountNum = pendingNum + availNum;               // total USDC in contract
+  const accountFiat = rate ? accountNum * rate.rate : null;
+  // Soonest unlock across the locked buckets → drives the maturity note with the
+  // REAL on-chain wait (this build settles in ~10 min; prod uses 30 days). We
+  // read the actual timestamp rather than hardcode a period that may be wrong.
+  const nextUnlock = lockedBuckets.reduce(
+    (min, b) => Math.min(min, Number(b.unlockTimestamp)),
+    Infinity
+  );
+  const nextUnlockSecs = nextUnlock === Infinity ? 0 : Math.max(0, nextUnlock - now);
 
   // The AMOUNT FIELD is now entered in LOCAL FIAT (₹ / R$ / …) — what a shopkeeper
   // thinks in — and we convert to USDC under the hood. Empty = withdraw MAX.
@@ -290,14 +305,34 @@ export default function Withdraw() {
           </div>
         )}
 
-        <div className="balance">
-          <div className="balance-label">{t("wd.ready")}</div>
-          <div className="balance-amount" style={{ fontSize: 42 }}>${availNum.toFixed(2)}</div>
-          <div className="balance-sub">
-            {availFiat != null ? `≈ ${fmtFiat(country, availFiat)} ${country.code}` : "≈ —"}
-            {Number(pending) > 0 ? ` · ${fmtUsdc(pending)} still settling` : ""}
+        {/* TWO balance figures, side by side, so the merchant sees at a glance
+            what they HAVE (account balance = everything in the contract) vs what
+            they can withdraw RIGHT NOW (matured/unlocked). The gap is funds still
+            in the settlement window. */}
+        <div className="wd-balances">
+          <div className="wd-bal-box">
+            <div className="wd-bal-label">{t("wd.accountBalance")}</div>
+            <div className="wd-bal-amt">${accountNum.toFixed(2)}</div>
+            <div className="wd-bal-sub">
+              {accountFiat != null ? `≈ ${fmtFiat(country, accountFiat)} ${country.code}` : "≈ —"}
+            </div>
+          </div>
+          <div className="wd-bal-box">
+            <div className="wd-bal-label">{t("wd.withdrawable")}</div>
+            <div className="wd-bal-amt">${availNum.toFixed(2)}</div>
+            <div className="wd-bal-sub">
+              {availFiat != null ? `≈ ${fmtFiat(country, availFiat)} ${country.code}` : "≈ —"}
+            </div>
           </div>
         </div>
+        {/* Funds still maturing → show how much and the REAL time until the next
+            tranche unlocks (read from chain, not a hardcoded period). */}
+        {pendingNum > 0 && (
+          <div className="wd-maturity">
+            {fmtUsdc(pending)} USDC {t("wd.settlingNote")}
+            {nextUnlockSecs > 0 ? ` · ${t("wd.maturityNote")} (${fmtRemaining(nextUnlockSecs)})` : ""}
+          </div>
+        )}
 
         {lockedBuckets.length > 0 && (
           <div className="wd-locked">
@@ -407,16 +442,30 @@ export default function Withdraw() {
         <p className="muted" style={{ textAlign: "center", fontSize: 12 }}>{t("wd.fetchingRate")}</p>
       )}
 
-      <div className="bottombar" style={{ flexDirection: "column", gap: 10 }}>
-        <button className="btn" style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
+      {/* TWO co-equal withdrawal destinations — bank (fiat) OR wallet (USDC).
+          Presented as labeled cards so the USDC option is clearly visible and
+          not mistaken for a fiat-only flow. */}
+      <div className="bottombar wd-dest-bar" style={{ flexDirection: "column", gap: 10 }}>
+        <div className="wd-dest-head">{t("wd.chooseDest")}</div>
+        <button className="wd-dest-btn"
           disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !rate)}
           onClick={() => withdraw("fiat")}>
-          <Icon.Bank /> {busy === "fiat" ? t("wd.working") : `${t("wd.sendToBank")} ${wdCountry?.fiat}`}
+          <span className="wd-dest-ico"><Icon.Bank /></span>
+          <span className="wd-dest-txt">
+            <b>{busy === "fiat" ? t("wd.working") : `${t("wd.sendToBank")} ${wdCountry?.fiat}`}</b>
+            <small>{t("wd.destBankHint")}</small>
+          </span>
+          <span className="wd-dest-arrow">›</span>
         </button>
-        <button className="btn dark" style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
+        <button className="wd-dest-btn usdc"
           disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !rate)}
           onClick={() => withdraw("usdc")}>
-          <Icon.Wallet /> {busy === "usdc" ? t("wd.working") : t("wd.keepUsdc")}
+          <span className="wd-dest-ico"><Icon.Wallet /></span>
+          <span className="wd-dest-txt">
+            <b>{busy === "usdc" ? t("wd.working") : t("wd.keepUsdc")}</b>
+            <small>{t("wd.destUsdcHint")}</small>
+          </span>
+          <span className="wd-dest-arrow">›</span>
         </button>
       </div>
     </>

@@ -1,6 +1,8 @@
 "use client";
 
 import { useState, useRef, useEffect } from "react";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useReadContract } from "wagmi";
 import { useSmartAccount } from "./useSmartAccount";
 import { useAuth } from "./useAuth";
@@ -12,6 +14,7 @@ import { CONTRACT_ADDRESS, INTEGRATOR_ABI, fmtUsdc } from "../lib/contract";
  * (copy), balance, and logout. Replaces the old Wallet nav tab.
  */
 export function AccountMenu() {
+  const router = useRouter();
   const { logout, email } = useAuth();
   const { address } = useSmartAccount();
   const [open, setOpen] = useState(false);
@@ -76,12 +79,12 @@ export function AccountMenu() {
             </div>
           </div>
 
-          <a className="acct-menu-link" href="/settings">Settings</a>
+          <Link className="acct-menu-link" href="/settings" onClick={() => setOpen(false)}>Settings</Link>
 
           <button
             className="btn secondary small"
             style={{ width: "100%" }}
-            onClick={() => { clearLocalUserData(); logout().finally(() => { window.location.href = "/login"; }); }}
+            onClick={() => { setOpen(false); clearLocalUserData(); logout().finally(() => router.replace("/login")); }}
           >
             Log out
           </button>

@@ -7,6 +7,7 @@ import { useCheckoutSigner } from "./useCheckoutSigner";
 import { SUBGRAPH_URL, USDC_ADDRESS, DIAMOND_ADDRESS, resolveCircleId, codeToHex } from "../lib/p2p";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, friendlyError } from "../lib/contract";
 import { ACTIVE_CHAIN } from "../lib/chain";
+import { Icon, Logo } from "./Icons";
 
 /**
  * Fiat cash-out via the official p2p.me Cashout widget. The widget owns the full
@@ -153,11 +154,19 @@ export function CashoutWidget({
   if (!ready || !signer) return <p className="muted">Preparing wallet…</p>;
 
   return (
-    <>
+    <div className="checkout-fullscreen">
+      <div className="checkout-fullscreen-head">
+        <Logo size={24} className="cf-mark" />
+        <b>PayQR Withdraw</b>
+      </div>
+      {onClose && (
+        <button className="checkout-fullscreen-close" onClick={() => onClose?.()} aria-label="Close">
+          <Icon.Close />
+        </button>
+      )}
       {err && <p className="error">{err}</p>}
       <Cashout
-        mode="modal"
-        open={true}
+        mode="inline"
         signer={signer as any}
         chainId={ACTIVE_CHAIN.id}
         diamondAddress={(DIAMOND_ADDRESS || undefined) as `0x${string}`}
@@ -179,6 +188,6 @@ export function CashoutWidget({
         onError={(e: any) => { const m = e?.userMessage || friendlyError(e, e?.message || "Something went wrong."); setErr(m); onError?.(m); }}
         onClose={() => onClose?.()}
       />
-    </>
+    </div>
   );
 }

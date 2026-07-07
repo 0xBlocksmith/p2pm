@@ -1,16 +1,25 @@
 "use client";
 
 import { useState } from "react";
+import dynamic from "next/dynamic";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useReadContract } from "wagmi";
+import { useActiveWallet } from "thirdweb/react";
 import { QRCodeSVG } from "qrcode.react";
 import { encodeFunctionData, parseUnits } from "viem";
 import { Icon } from "./Icons";
 import { useT } from "../lib/i18n";
 import { useSmartAccount } from "./useSmartAccount";
 import { useAuth } from "./useAuth";
+
+// Heavy @walletconnect deps — only pulled in when the merchant opens the panel.
+const WalletConnectPanel = dynamic(
+  () => import("./WalletConnectPanel").then((m) => m.WalletConnectPanel),
+  { ssr: false, loading: () => <p className="muted" style={{ textAlign: "center", padding: "24px 0" }}>Loading…</p> }
+);
 import { CONTRACT_ADDRESS, fmtUsdc } from "../lib/contract";
+import { STATIC_STALE_MS } from "../lib/cache";
 import { fmtFiat, clearLocalUserData } from "../lib/countries";
 import { ACTIVE_CHAIN } from "../lib/chain";
 
@@ -60,7 +69,8 @@ export function WalletSheet({
   const router = useRouter();
   const { sendTransaction } = useSmartAccount();
   const { logout } = useAuth();
-  const [tab, setTab] = useState<"home" | "receive" | "send">("home");
+  const activeWallet = useActiveWallet();
+  const [tab, setTab] = useState<"home" | "receive" | "send" | "walletconnect">("home");
   const [copied, setCopied] = useState(false);
   const [to, setTo] = useState("");
   const [amt, setAmt] = useState("");
@@ -69,7 +79,7 @@ export function WalletSheet({
 
   const { data: info } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INFO_ABI, functionName: "getMerchantInfo",
-    args: [address as `0x${string}`], query: { enabled: !!address && open },
+    args: [address as `0x${string}`], query: { enabled: !!address && open, staleTime: STATIC_STALE_MS },
   });
   const { data: balance } = useReadContract({
     address: CONTRACT_ADDRESS, abi: BAL_ABI, functionName: "getMerchantBalance",
@@ -188,6 +198,10 @@ export function WalletSheet({
                   <span>{t("wallet.viewAssets")}</span><span className="wmenu-car">↗</span>
                 </a>
               )}
+              <button className="wmenu-row" onClick={() => setTab("walletconnect")}>
+                <span className="wmenu-ico"><Icon.Link width="18" height="18" /></span>
+                <span>{t("wallet.connectDapp")}</span><span className="wmenu-car">›</span>
+              </button>
               <button className="wmenu-row" onClick={() => { onClose(); router.push("/settings"); }}>
                 <span className="wmenu-ico"><Icon.Gear width="18" height="18" /></span>
                 <span>{t("wallet.manage")}</span><span className="wmenu-car">›</span>
@@ -229,6 +243,11 @@ export function WalletSheet({
               {busy ? t("wd.working") : `${t("wallet.send")} USDC`}
             </button>
           </div>
+        )}
+
+        {/* CONNECT TO A DAPP tab (WalletConnect) */}
+        {tab === "walletconnect" && (
+          <WalletConnectPanel wallet={activeWallet} onBack={() => setTab("home")} />
         )}
       </div>
     </div>

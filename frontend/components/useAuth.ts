@@ -54,8 +54,9 @@ const AUTH_OPTIONS = [
   "x",
   "telegram",
   "farcaster",
-  "passkey",
-  "guest",
+  // "passkey" and "guest" intentionally omitted: guest accounts let anyone spin
+  // up throwaway identities (fraud-account vector), and passkey confused genuine
+  // users about which method to pick. Keep the login to real email/phone/social.
 ] as const;
 
 /**

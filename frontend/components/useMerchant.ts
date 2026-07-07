@@ -4,6 +4,7 @@ import { useEffect } from "react";
 import { useRouter } from "next/navigation";
 import { useReadContract } from "wagmi";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI } from "../lib/contract";
+import { STATIC_STALE_MS } from "../lib/cache";
 import { useSmartAccount } from "./useSmartAccount";
 import { useAuth } from "./useAuth";
 import { prefsSet } from "../lib/countries";
@@ -25,7 +26,7 @@ export function useMerchant({ requireRegistered = true } = {}) {
     abi: INTEGRATOR_ABI,
     functionName: "registered",
     args: [address],
-    query: { enabled: !!address },
+    query: { enabled: !!address, staleTime: STATIC_STALE_MS },
   });
 
   useEffect(() => {

@@ -11,6 +11,7 @@ import { AppTour } from "../../components/AppTour";
 import { ConnectionBanner } from "../../components/ConnectionBanner";
 import { WalletSheet } from "../../components/WalletSheet";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, fmtUsdc } from "../../lib/contract";
+import { STATIC_STALE_MS } from "../../lib/cache";
 import { fetchUsdcRate } from "../../lib/rates";
 import { fetchHistory } from "../../lib/history";
 import { loadCountry, fmtFiat } from "../../lib/countries";
@@ -51,8 +52,10 @@ export default function Dashboard() {
     address: CONTRACT_ADDRESS,
     abi: INTEGRATOR_ABI,
     functionName: "registered",
+    // Registration doesn't change during a session — cache it so it isn't
+    // re-read from RPC on every dashboard mount.
     args: [address],
-    query: { enabled: !!address },
+    query: { enabled: !!address, staleTime: STATIC_STALE_MS },
   });
 
   function acceptPayment() {
@@ -114,6 +117,10 @@ export default function Dashboard() {
   const [used, limit] = daily ?? [0n, 25n];
   const availUsdc = Number(available) / 1e6;
   const fiatEquiv = rate && country ? availUsdc * rate.rate : null;
+  // Account balance = everything in the contract (locked + unlocked). NOT
+  // totalDeposited (a lifetime counter). Withdrawable = the unlocked part.
+  const accountUsdc = (Number(pending) + Number(available)) / 1e6;
+  const accountFiat = rate && country ? accountUsdc * rate.rate : null;
 
   // Settlement-ready notification: when the available balance JUMPS UP between
   // refetches, a locked bucket just cleared — tell the merchant their money is
@@ -216,14 +223,23 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* Balance hero — p2p.me: white, big black amount, fiat below */}
-        <div className="balance">
-          <div className="balance-label">{t("dash.available")}</div>
-          <div className="balance-amount">${(availUsdc || 0).toFixed(2)}</div>
-          <div className="balance-sub">
-            {fiatEquiv != null
-              ? `≈ ${fmtFiat(country, fiatEquiv)}`
-              : `≈ ${country.symbol}0.00`}
+        {/* Balance hero — one neutral card, two figures split by a line:
+            Account balance (all funds in the contract) | Withdrawable now
+            (matured/unlocked). Same style as the withdraw page. */}
+        <div className="wd-balances">
+          <div className="wd-bal-box">
+            <div className="wd-bal-label">{t("wd.accountBalance")}</div>
+            <div className="wd-bal-amt">${(accountUsdc || 0).toFixed(2)}</div>
+            <div className="wd-bal-sub">
+              {accountFiat != null ? `≈ ${fmtFiat(country, accountFiat)}` : `≈ ${country.symbol}0.00`}
+            </div>
+          </div>
+          <div className="wd-bal-box">
+            <div className="wd-bal-label">{t("wd.withdrawable")}</div>
+            <div className="wd-bal-amt">${(availUsdc || 0).toFixed(2)}</div>
+            <div className="wd-bal-sub">
+              {fiatEquiv != null ? `≈ ${fmtFiat(country, fiatEquiv)}` : `≈ ${country.symbol}0.00`}
+            </div>
           </div>
         </div>
 

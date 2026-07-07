@@ -117,10 +117,13 @@ export function clearLocalUserData(): void {
   // shared device never leaves one merchant's payout key for the next account.
   try {
     exact.forEach((k) => localStorage.removeItem(k));
+    // Prefix-match: per-address relay identities AND cached merchant profiles —
+    // so a shared device never leaves one merchant's payout key or shop name for
+    // the next account.
     const toRemove: string[] = [];
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
-      if (k && k.startsWith("payqr.relay:")) toRemove.push(k);
+      if (k && (k.startsWith("payqr.relay:") || k.startsWith("payqr.merchantProfile:"))) toRemove.push(k);
     }
     toRemove.forEach((k) => localStorage.removeItem(k));
   } catch { /* ignore */ }

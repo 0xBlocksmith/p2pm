@@ -8,6 +8,8 @@ import { useMerchant } from "../../components/useMerchant";
 import { Icon } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, perTxCapUsdc, currencyFromBytes32 } from "../../lib/contract";
 import { fetchUsdcRate } from "../../lib/rates";
+import { fetchPriceConfig, usdcForFiat } from "../../lib/pricing";
+import { STATIC_STALE_MS, loadMerchantProfile, saveMerchantProfile } from "../../lib/cache";
 import { loadCountry, fmtFiat, COUNTRIES, getCountry } from "../../lib/countries";
 import { loadPendingOrder, savePendingOrder, clearPendingOrder } from "../../lib/p2p";
 import { fetchOrder, receiptToken } from "../../lib/history";
@@ -76,6 +78,7 @@ export default function PosQr() {
   const [liveWidget, setLiveWidget] = useState(null);
   const [done, setDone] = useState(null);
   const [payError, setPayError] = useState("");
+  const [busy, setBusy] = useState(false); // pricing the sale (reading on-chain buyPrice)
   const [imgBusy, setImgBusy] = useState(false);
   const captureRef = useRef<HTMLDivElement>(null);
   // A payment session that was started but not finished (widget closed / left)
@@ -138,17 +141,23 @@ export default function PosQr() {
   // without registering, send them to set up their shop first.
   const { data: isRegistered } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "registered",
-    args: [address], query: { enabled: !!address },
+    args: [address], query: { enabled: !!address, staleTime: STATIC_STALE_MS },
   });
   useEffect(() => {
     if (isRegistered === false) router.replace("/onboarding");
   }, [isRegistered, router]);
 
+  // Shop profile (name / registered currency) is static for the session — cache it.
   const { data: info } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "getMerchantInfo",
-    args: [address], query: { enabled: !!address },
+    args: [address], query: { enabled: !!address, staleTime: STATIC_STALE_MS },
   });
-  const shopLabel = info?.[1] || "";
+  // Persist the (non-financial) profile so the shop name paints INSTANTLY on the
+  // next visit while the fresh on-chain read confirms in the background.
+  const [cachedProfile, setCachedProfile] = useState(() => loadMerchantProfile(address));
+  useEffect(() => { setCachedProfile(loadMerchantProfile(address)); }, [address]);
+  useEffect(() => { if (address && info) saveMerchantProfile(address, info); }, [address, info]);
+  const shopLabel = info?.[1] || cachedProfile?.shopName || "";
 
   const { data: daily, refetch: refetchDaily } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "getDailyTxInfo",
@@ -208,7 +217,7 @@ export default function PosQr() {
     });
   }
 
-  function generate() {
+  async function generate() {
     setError("");
     if (!rate) return;
     if (amtNum <= 0) return setError(`Enter the amount in ${country.code}.`);
@@ -217,19 +226,42 @@ export default function PosQr() {
         `Max ${capUsdc} USDC per sale (≈ ${fmtFiat(country, capUsdc * rate.rate)} now).`
       );
     }
-    const quantity = BigInt(Math.round(usdcEquiv * 100));
+
+    // SIZE THE USDC SO THE CUSTOMER PAYS EXACTLY WHAT THE MERCHANT QUOTED.
+    // The widget derives the customer's fiat total from the Diamond's live
+    // buyPrice (+ small-order fee), NOT from our estimate rate — so sizing off
+    // usdcEquiv (lib/rates.ts) makes a ₹500 quote render as ~₹492. Instead we
+    // read the SAME on-chain price the widget uses and invert it, so the quote,
+    // the preview, the "Pay exactly" screen and the UPI link all agree. The
+    // merchant absorbs the USDC↔fiat spread — exactly the intended behavior.
+    // Falls back to the estimate-rate math if the Diamond can't be priced.
+    setBusy(true);
+    let usdcTarget: bigint;
+    try {
+      const cfg = await fetchPriceConfig(country.code);
+      usdcTarget = cfg ? usdcForFiat(amtNum, cfg) : BigInt(Math.round(usdcEquiv * 1e6));
+    } catch {
+      usdcTarget = BigInt(Math.round(usdcEquiv * 1e6));
+    } finally {
+      setBusy(false);
+    }
+
+    // Our integrator prices in whole USDC cents (product-2 units = 0.01 USDC),
+    // so quantity must be an integer number of cents and usdcAmount is derived
+    // from it (× 10_000 6-dec units) — keeping the widget's displayed amount
+    // exactly equal to the on-chain order total (quantity × unit price). We
+    // round the on-chain-priced target to the nearest cent; the customer's fiat
+    // then lands within a half-cent of the quote (vs the old ~1.6% shortfall).
+    const quantity = (usdcTarget + 5_000n) / 10_000n; // round to nearest cent
     if (quantity === 0n) return setError("Amount too small.");
-    setLastAmt(amt);
-    // Derive usdcAmount FROM quantity (× 0.01 USDC = 10_000 6-dec units) so the
-    // amount shown to the customer in the widget exactly equals the on-chain
-    // order total (quantity × unit price). Rounding them independently could
-    // diverge by up to half a cent.
     const usdcAmount = quantity * 10_000n;
-    setLiveWidget({ usdcAmount, quantity, fiat: amtNum, usdc: usdcEquiv });
+    const usdc = Number(usdcAmount) / 1e6;
+    setLastAmt(amt);
+    setLiveWidget({ usdcAmount, quantity, fiat: amtNum, usdc });
     // Persist so the session survives a closed dialog / refresh and can be resumed.
     saveSession({
       usdcAmount: usdcAmount.toString(), quantity: quantity.toString(),
-      fiat: amtNum, usdc: usdcEquiv, currency: country.code,
+      fiat: amtNum, usdc, currency: country.code,
     });
   }
 
@@ -512,8 +544,8 @@ export default function PosQr() {
 
             <button className="btn t-charge"
               style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
-              disabled={!ready || !rate || amtNum <= 0 || overCap} onClick={generate}>
-              <Icon.Qr /> {amtNum > 0 ? `${t("common.acceptPayment")} · ${country.symbol}${fmtTyped(amt, country)}` : t("common.acceptPayment")}
+              disabled={!ready || !rate || amtNum <= 0 || overCap || busy} onClick={generate}>
+              <Icon.Qr /> {busy ? t("qr.fetchingRate") : amtNum > 0 ? `${t("common.acceptPayment")} · ${country.symbol}${fmtTyped(amt, country)}` : t("common.acceptPayment")}
             </button>
             {error && <p className="error" style={{ textAlign: "center" }}>{error}</p>}
             <div className="t-foot">{String(used)} / {String(limit)} sales today</div>

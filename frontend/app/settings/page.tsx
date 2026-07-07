@@ -10,6 +10,7 @@ import { useMerchant } from "../../components/useMerchant";
 import { useSmartAccount } from "../../components/useSmartAccount";
 import { Icon } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI } from "../../lib/contract";
+import { STATIC_STALE_MS } from "../../lib/cache";
 import {
   COUNTRIES, LANGUAGES, loadCountry, loadLang, saveCountry, saveLang, clearLocalUserData,
 } from "../../lib/countries";
@@ -39,7 +40,7 @@ export default function Settings() {
 
   const { data: info, refetch: refetchInfo } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "getMerchantInfo",
-    args: [address], query: { enabled: !!address },
+    args: [address], query: { enabled: !!address, staleTime: STATIC_STALE_MS },
   });
   const payoutId = info?.[0] || "";
   const shopName = info?.[1] || "";

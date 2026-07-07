@@ -155,9 +155,14 @@ export default function Receipt() {
   // "notOurs" (foreign/random → not found), or "unverified" (couldn't check →
   // refresh). We only render a valid receipt on "verified" — never fail open.
   const [ownerState, setOwnerState] = useState<null | "verified" | "notOurs" | "unverified">(null);
+  // Bumping this re-runs the on-chain verification WITHOUT a full page reload
+  // (the "Refresh" button on the unverified state). Keeps the PWA feel — no
+  // white flash, no wallet/provider re-boot.
+  const [retry, setRetry] = useState(0);
 
   useEffect(() => {
     let on = true;
+    setLoading(true); setOwnerState(null);
     if (!safeId || !accessToken) { setLoading(false); setOwnerState("notOurs"); return; }
     fetchOrder(safeId).then((o: any) => {
       if (!on) return;
@@ -178,7 +183,7 @@ export default function Receipt() {
       });
     });
     return () => { on = false; };
-  }, [safeId, accessToken]);
+  }, [safeId, accessToken, retry]);
 
   // The trustworthy shop name comes ONLY from the chain (verifiedShop). The URL
   // ?shop= hint is shown just as a fallback label AND only on a verified receipt —
@@ -265,7 +270,7 @@ export default function Receipt() {
               in a moment.
             </p>
             <button className="btn" style={{ marginTop: 14 }}
-              onClick={() => { if (typeof window !== "undefined") window.location.reload(); }}>
+              onClick={() => setRetry((n) => n + 1)}>
               Refresh
             </button>
           </div>

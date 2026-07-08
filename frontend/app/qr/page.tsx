@@ -27,6 +27,8 @@ const CheckoutWidget = dynamic(
 
 // Quick-amount presets per country (local fiat).
 const QUICK = { INR: [10, 20, 50], BRL: [5, 10, 20], ARS: [500, 1000, 2000] };
+// Quick-amount presets when charging directly in USDC.
+const QUICK_USDC = [1, 5, 10];
 
 // Format the RAW typed amount for display: group the integer part with the
 // country's locale but keep the decimal part EXACTLY as typed (so "10.", "10.1",
@@ -73,6 +75,7 @@ export default function PosQr() {
   const [pickOpen, setPickOpen] = useState(false);
   const [amt, setAmt] = useState("");        // local fiat the merchant types
   const [lastAmt, setLastAmt] = useState(""); // for "repeat"
+  const [inputMode, setInputMode] = useState<"fiat" | "usdc">("fiat"); // what `amt` is denominated in
   const [rate, setRate] = useState(null);
   const [error, setError] = useState("");
   const [liveWidget, setLiveWidget] = useState(null);
@@ -187,7 +190,11 @@ export default function PosQr() {
   }, [country]);
 
   const amtNum = Number(amt) || 0;
-  const usdcEquiv = rate && amtNum > 0 ? amtNum / rate.rate : 0;
+  // In USDC mode the typed number IS the USDC amount; in fiat mode it's derived
+  // from the estimate rate (the on-chain price is what actually sizes the order,
+  // in generate()).
+  const usdcEquiv = inputMode === "usdc" ? amtNum : (rate && amtNum > 0 ? amtNum / rate.rate : 0);
+  const fiatEquiv = inputMode === "usdc" ? (rate && amtNum > 0 ? amtNum * rate.rate : 0) : amtNum;
   // Per-tx cap keys off the merchant's REGISTERED currency (what the contract
   // enforces in validateOrder), NOT the currency picked in the terminal — else
   // an INR merchant (50 cap) charging in BRL would be shown a 100 cap and the
@@ -220,48 +227,58 @@ export default function PosQr() {
   async function generate() {
     setError("");
     if (!rate) return;
-    if (amtNum <= 0) return setError(`Enter the amount in ${country.code}.`);
+    if (amtNum <= 0) return setError(inputMode === "usdc" ? "Enter the amount in USDC." : `Enter the amount in ${country.code}.`);
     if (overCap) {
       return setError(
         `Max ${capUsdc} USDC per sale (≈ ${fmtFiat(country, capUsdc * rate.rate)} now).`
       );
     }
 
-    // SIZE THE USDC SO THE CUSTOMER PAYS EXACTLY WHAT THE MERCHANT QUOTED.
-    // The widget derives the customer's fiat total from the Diamond's live
-    // buyPrice (+ small-order fee), NOT from our estimate rate — so sizing off
-    // usdcEquiv (lib/rates.ts) makes a ₹500 quote render as ~₹492. Instead we
-    // read the SAME on-chain price the widget uses and invert it, so the quote,
-    // the preview, the "Pay exactly" screen and the UPI link all agree. The
-    // merchant absorbs the USDC↔fiat spread — exactly the intended behavior.
-    // Falls back to the estimate-rate math if the Diamond can't be priced.
     setBusy(true);
     let usdcTarget: bigint;
-    try {
-      const cfg = await fetchPriceConfig(country.code);
-      usdcTarget = cfg ? usdcForFiat(amtNum, cfg) : BigInt(Math.round(usdcEquiv * 1e6));
-    } catch {
-      usdcTarget = BigInt(Math.round(usdcEquiv * 1e6));
-    } finally {
+    if (inputMode === "usdc") {
+      // The merchant typed the USDC amount directly — charge exactly that, no
+      // fiat-quote inversion needed.
+      usdcTarget = BigInt(Math.round(amtNum * 1e6));
       setBusy(false);
+    } else {
+      // SIZE THE USDC SO THE CUSTOMER PAYS EXACTLY WHAT THE MERCHANT QUOTED.
+      // The widget derives the customer's fiat total from the Diamond's live
+      // buyPrice (+ small-order fee), NOT from our estimate rate — so sizing off
+      // usdcEquiv (lib/rates.ts) makes a ₹500 quote render as ~₹492. Instead we
+      // read the SAME on-chain price the widget uses and invert it, so the quote,
+      // the preview, the "Pay exactly" screen and the UPI link all agree. The
+      // merchant absorbs the USDC↔fiat spread — exactly the intended behavior.
+      // Falls back to the estimate-rate math if the Diamond can't be priced.
+      try {
+        const cfg = await fetchPriceConfig(country.code);
+        usdcTarget = cfg ? usdcForFiat(amtNum, cfg) : BigInt(Math.round(usdcEquiv * 1e6));
+      } catch {
+        usdcTarget = BigInt(Math.round(usdcEquiv * 1e6));
+      } finally {
+        setBusy(false);
+      }
     }
 
     // Our integrator prices in whole USDC cents (product-2 units = 0.01 USDC),
     // so quantity must be an integer number of cents and usdcAmount is derived
     // from it (× 10_000 6-dec units) — keeping the widget's displayed amount
-    // exactly equal to the on-chain order total (quantity × unit price). We
-    // round the on-chain-priced target to the nearest cent; the customer's fiat
-    // then lands within a half-cent of the quote (vs the old ~1.6% shortfall).
+    // exactly equal to the on-chain order total (quantity × unit price).
+    // usdcForFiat() already snaps to the cent that lands closest to the quoted
+    // fiat total (picking whichever neighbour minimizes the drift, not just
+    // rounding the pre-fee amount) — this is a no-op for that path, and a
+    // safety-net round for the USDC-direct-entry / no-price-config fallbacks.
     const quantity = (usdcTarget + 5_000n) / 10_000n; // round to nearest cent
     if (quantity === 0n) return setError("Amount too small.");
     const usdcAmount = quantity * 10_000n;
     const usdc = Number(usdcAmount) / 1e6;
+    const fiatCharged = inputMode === "usdc" ? usdc * rate.rate : amtNum;
     setLastAmt(amt);
-    setLiveWidget({ usdcAmount, quantity, fiat: amtNum, usdc });
+    setLiveWidget({ usdcAmount, quantity, fiat: fiatCharged, usdc });
     // Persist so the session survives a closed dialog / refresh and can be resumed.
     saveSession({
       usdcAmount: usdcAmount.toString(), quantity: quantity.toString(),
-      fiat: amtNum, usdc, currency: country.code,
+      fiat: fiatCharged, usdc, currency: country.code,
     });
   }
 
@@ -483,37 +500,57 @@ export default function PosQr() {
             {/* charge-currency picker — only shows currencies the protocol can
                 settle (live circles). Lets a merchant accept in any supported
                 currency, e.g. when travelling. Default = registered country. */}
-            {payOpts.length > 1 && (
-              <div className="cur-pick">
-                <button className={`cur-pick-btn ${pickOpen ? "on" : ""}`}
-                  onClick={() => setPickOpen((o) => !o)}>
-                  <span className="cur-pick-label">{t("qr.chargeIn")}</span>
-                  <img className="cur-flag" src={`https://flagcdn.com/w40/${({india:"in",brazil:"br",argentina:"ar"})[country.id] || "un"}.png`} alt="" />
-                  <b>{country.code}</b><span className="cur-car">▾</span>
+            <div className="cur-pick-row">
+              {payOpts.length > 1 && (
+                <div className="cur-pick">
+                  <button className={`cur-pick-btn ${pickOpen ? "on" : ""}`}
+                    onClick={() => setPickOpen((o) => !o)}>
+                    <span className="cur-pick-label">{t("qr.chargeIn")}</span>
+                    <img className="cur-flag" src={`https://flagcdn.com/w40/${({india:"in",brazil:"br",argentina:"ar"})[country.id] || "un"}.png`} alt="" />
+                    <b>{country.code}</b><span className="cur-car">▾</span>
+                  </button>
+                  {pickOpen && (
+                    <div className="cur-pick-pop">
+                      {payOpts.map((c) => (
+                        <button key={c.id} className={`cur-pick-item ${c.id === country.id ? "sel" : ""}`}
+                          onClick={() => { setCountry(c); setAmt(""); setError(""); setPickOpen(false); }}>
+                          <img className="cur-flag" src={`https://flagcdn.com/w40/${({india:"in",brazil:"br",argentina:"ar"})[c.id] || "un"}.png`} alt="" />
+                          <span className="cur-pick-txt">{c.name}<small>{c.fiat} · {c.symbol} {c.code}</small></span>
+                          {c.id === country.id && <span className="cur-chk">✓</span>}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+              {/* fiat / USDC input-mode toggle — switches what the keypad + quick
+                  chips are denominated in. */}
+              <div className="mode-toggle">
+                <button className={`mode-toggle-opt ${inputMode === "fiat" ? "sel" : ""}`}
+                  onClick={() => { setInputMode("fiat"); setAmt(""); setError(""); }}>
+                  {country.code}
                 </button>
-                {pickOpen && (
-                  <div className="cur-pick-pop">
-                    {payOpts.map((c) => (
-                      <button key={c.id} className={`cur-pick-item ${c.id === country.id ? "sel" : ""}`}
-                        onClick={() => { setCountry(c); setAmt(""); setError(""); setPickOpen(false); }}>
-                        <img className="cur-flag" src={`https://flagcdn.com/w40/${({india:"in",brazil:"br",argentina:"ar"})[c.id] || "un"}.png`} alt="" />
-                        <span className="cur-pick-txt">{c.name}<small>{c.fiat} · {c.symbol} {c.code}</small></span>
-                        {c.id === country.id && <span className="cur-chk">✓</span>}
-                      </button>
-                    ))}
-                  </div>
-                )}
+                <button className={`mode-toggle-opt ${inputMode === "usdc" ? "sel" : ""}`}
+                  onClick={() => { setInputMode("usdc"); setAmt(""); setError(""); }}>
+                  USDC
+                </button>
               </div>
-            )}
+            </div>
             <div className="t-amount">
               <div className="t-shop">{shopLabel || t("qr.newSale")}</div>
               {/* Show the RAW typed string (preserves "10." and decimals while
                   typing) with grouping on the integer part only — passing `amt`
                   through fmtFiat would round away the decimal being entered. */}
-              <div className="t-value">{country.symbol}{fmtTyped(amt, country)}</div>
+              <div className="t-value">
+                {inputMode === "usdc" ? `${fmtTyped(amt, country)} USDC` : `${country.symbol}${fmtTyped(amt, country)}`}
+              </div>
               <div className="t-sub">
                 {rate
-                  ? amtNum > 0 ? `≈ ${usdcEquiv.toFixed(2)} USDC ${t("qr.youKeep")}` : t("qr.enterAmount")
+                  ? amtNum > 0
+                    ? inputMode === "usdc"
+                      ? `≈ ${fmtFiat(country, fiatEquiv)} ${country.code}`
+                      : `≈ ${usdcEquiv.toFixed(2)} USDC ${t("qr.youKeep")}`
+                    : t("qr.enterAmount")
                   : t("qr.fetchingRate")}
               </div>
               {overCap && rate && (
@@ -523,9 +560,9 @@ export default function PosQr() {
 
             {/* quick amounts + repeat */}
             <div className="quick-amts">
-              {quick.map((q) => (
+              {(inputMode === "usdc" ? QUICK_USDC : quick).map((q) => (
                 <button key={q} className="qa-chip" onClick={() => { setAmt(String(q)); setError(""); }}>
-                  {country.symbol}{q}
+                  {inputMode === "usdc" ? `${q} USDC` : `${country.symbol}${q}`}
                 </button>
               ))}
               <button className="qa-chip repeat" disabled={!lastAmt}
@@ -545,7 +582,7 @@ export default function PosQr() {
             <button className="btn t-charge"
               style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
               disabled={!ready || !rate || amtNum <= 0 || overCap || busy} onClick={generate}>
-              <Icon.Qr /> {busy ? t("qr.fetchingRate") : amtNum > 0 ? `${t("common.acceptPayment")} · ${country.symbol}${fmtTyped(amt, country)}` : t("common.acceptPayment")}
+              <Icon.Qr /> {busy ? t("qr.fetchingRate") : amtNum > 0 ? `${t("common.acceptPayment")} · ${inputMode === "usdc" ? `${fmtTyped(amt, country)} USDC` : `${country.symbol}${fmtTyped(amt, country)}`}` : t("common.acceptPayment")}
             </button>
             {error && <p className="error" style={{ textAlign: "center" }}>{error}</p>}
             <div className="t-foot">{String(used)} / {String(limit)} sales today</div>

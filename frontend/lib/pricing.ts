@@ -97,30 +97,53 @@ export async function fetchPriceConfig(code: string): Promise<PriceConfig | null
   }
 }
 
+// Our integrator prices in whole USDC CENTS (product-2 units = 0.01 USDC) — the
+// on-chain `quantity` can't represent anything finer, so usdcAmount must always
+// be a multiple of this.
+const USDC_CENT = 10_000n; // 6-dec units
+
 /**
- * Size the USDC amount so the customer's on-chain total lands EXACTLY on the
- * quoted fiat. `quoteFiat` is the plain fiat number the merchant typed (e.g.
- * 500 for ₹500). Returns 6-dec `usdcAmount`, or null if it can't be priced.
+ * Size the USDC amount so the customer's on-chain total lands as close as
+ * possible to the quoted fiat. `quoteFiat` is the plain fiat number the
+ * merchant typed (e.g. 500 for ₹500). Returns 6-dec `usdcAmount`, already
+ * snapped to a whole USDC cent (the only granularity the contract accepts),
+ * or null if it can't be priced.
  *
  * Inverts the widget's totalFiat = usdcAmount*buyPrice/1e6 + feeUsdc*buyPrice/1e6.
  * The fee only applies to small orders (usdcAmount <= threshold), so we solve
  * once assuming the fee applies, then drop it if the result is above threshold
  * and re-solve without it — matching the widget's own conditional exactly.
+ *
+ * The exact-fiat solution is rarely a whole cent, and rounding it naively (as
+ * we used to, in the caller, after this function returned) can drift the
+ * displayed total by up to half a cent of USDC — at low buyPrice currencies
+ * that's nearly a full unit of fiat (e.g. ~₹0.91 at 91 INR/USDC), which read
+ * as "the total doesn't match what I typed" on small orders. Snap to the
+ * nearest cent HERE instead, checking both neighbours against the actual
+ * resulting fiat total (including the fee's own threshold flip), so the
+ * final total is the closest a whole-cent amount can get to the quote.
  */
 export function usdcForFiat(quoteFiat: number, cfg: PriceConfig): bigint {
   const quoteFiat6 = BigInt(Math.round(quoteFiat * 1e6)); // 6-dec fiat
   const { buyPrice, smallOrderThreshold, smallOrderFixedFee } = cfg;
 
-  // grossUsdc solves usdcAmount*buyPrice/1e6 == quoteFiat6 (before backing out a fee).
+  // Exact-fiat usdc solving totalFiat == quoteFiat6, before snapping to a cent.
   const grossUsdc = (quoteFiat6 * 1_000_000n) / buyPrice;
-
-  // Assume the fee applies (typical POS small order): back it out so that
-  // (usdcAmount + fee)*buyPrice/1e6 == quoteFiat6.
   let usdc = grossUsdc > smallOrderFixedFee ? grossUsdc - smallOrderFixedFee : grossUsdc;
-
-  // If that lands ABOVE the small-order threshold, no fee is actually charged —
-  // re-solve without the fee so we don't undershoot the quote.
   if (usdc > smallOrderThreshold) usdc = grossUsdc;
+  if (usdc <= 0n) return 0n;
 
-  return usdc > 0n ? usdc : 0n;
+  // What the customer actually pays for a given (already cent-snapped) usdc
+  // amount, mirroring the widget's own preview math exactly.
+  const totalFiatFor = (u: bigint) => {
+    const feeUsdc = u > 0n && u <= smallOrderThreshold ? smallOrderFixedFee : 0n;
+    return u * buyPrice / 1_000_000n + feeUsdc * buyPrice / 1_000_000n;
+  };
+
+  const lo = (usdc / USDC_CENT) * USDC_CENT;
+  const hi = lo + USDC_CENT;
+  if (lo <= 0n) return hi;
+  const loDiff = quoteFiat6 > totalFiatFor(lo) ? quoteFiat6 - totalFiatFor(lo) : totalFiatFor(lo) - quoteFiat6;
+  const hiDiff = totalFiatFor(hi) > quoteFiat6 ? totalFiatFor(hi) - quoteFiat6 : quoteFiat6 - totalFiatFor(hi);
+  return hiDiff < loDiff ? hi : lo;
 }

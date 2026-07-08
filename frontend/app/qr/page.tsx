@@ -34,13 +34,16 @@ const QUICK_USDC = [1, 5, 10];
 // country's locale but keep the decimal part EXACTLY as typed (so "10.", "10.1",
 // "10.10" all render faithfully while the merchant is entering them). Passing the
 // string through a number formatter would round/strip the in-progress decimal.
-function fmtTyped(raw: string, country: any): string {
+function fmtTyped(raw: string, _country?: any): string {
   if (!raw) return "0";
   const [intPart, decPart] = raw.split(".");
-  let grouped = "0";
-  try {
-    grouped = (Number(intPart) || 0).toLocaleString(country?.locale || undefined);
-  } catch { grouped = intPart || "0"; }
+  // Group the integer part with a COMMA and keep "." as the decimal separator —
+  // ALWAYS, regardless of locale. The keypad's decimal key inserts a ".", but
+  // pt-BR / es-AR use "." as their THOUSANDS separator, so a locale formatter
+  // turns "1000" into "1.000" (reads as a decimal) and "1000.50" into the
+  // ambiguous "1.000.50". A fixed comma-group / dot-decimal keeps the amount
+  // unmistakable and consistent with what the merchant typed.
+  const grouped = (intPart || "0").replace(/^0+(?=\d)/, "").replace(/\B(?=(\d{3})+(?!\d))/g, ",");
   return decPart !== undefined ? `${grouped}.${decPart}` : grouped;
 }
 
@@ -465,7 +468,18 @@ export default function PosQr() {
           <div className="panel" style={{ textAlign: "center" }}>
             <h2>Payment in progress</h2>
             <p className="muted" style={{ margin: "6px 0 12px" }}>
-              You have an unfinished sale of {fmtFiat(country, pendingSession.fiat)} {pendingSession.currency}.
+              {/* Format with the currency the session was STARTED in, not the
+                  current `country` (which may have reverted to the merchant's
+                  home currency on a remount) — else a BRL session shows the ₹
+                  symbol / INR grouping. Mirrors resumeSession()'s resolution. */}
+              You have an unfinished sale of{" "}
+              {fmtFiat(
+                (pendingSession.countryId != null ? getCountry(pendingSession.countryId) : null) ||
+                  COUNTRIES.find((c) => c.code === pendingSession.currency) ||
+                  country,
+                pendingSession.fiat
+              )}{" "}
+              {pendingSession.currency}.
               Resume to show the QR again, or cancel to start over.
             </p>
             <div style={{ display: "flex", gap: 8 }}>

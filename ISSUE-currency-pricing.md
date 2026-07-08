@@ -1,7 +1,18 @@
 # Issue: Non-INR currency pricing is wrong (BRL massively overpriced, ARS unpriceable)
 
-**Status:** Open · **Severity:** High (customers overcharged ~185× on BRL; ARS orders cannot be placed)
+**Status:** App-side mitigations DONE · underlying on-chain price fix still OPEN (protocol-side)
+**Severity:** High (customers overcharged ~185× on BRL; ARS orders cannot be placed)
 **Reported:** 2026-07-08 (BRL test order, see screenshot) · **Filed by:** review
+**Last updated:** 2026-07-08
+
+> **TL;DR of the update:** the root cause is unchanged — BRL/ARS have wrong
+> on-chain prices on the Diamond, which only the protocol admin can fix via
+> `setPriceConfig`. On the app side we have since (a) removed the external FX
+> rate so every screen shows ONE p2p rate, (b) switched dashboard/withdraw to
+> the sell price, and (c) fixed the BRL/ARS amount-typing denomination. These
+> make the app self-consistent and readable, but a BRL/ARS checkout is still
+> economically wrong until the on-chain price is corrected. See
+> **[App-side changes already shipped](#app-side-changes-already-shipped)**.
 
 ---
 
@@ -67,10 +78,13 @@ agree with the checkout on the **wrong** number, because the shared source of
 truth — the on-chain `buyPrice` — is itself wrong. Consistency was fixed;
 correctness of the underlying price data was not (and can't be, from the app).
 
-The one genuinely INR-only piece of code is the market-rate *reference* in
-`lib/rates.ts` (`fetchUsdcInrRate` uses the p2p subgraph; others use CoinGecko).
-That only affects the pre-submit "≈ X" estimate fallback, **not** the price the
-customer is actually charged — so it is not the cause of this bug.
+There *was* one genuinely INR-only piece of code — the market-rate *reference*
+in `lib/rates.ts` (INR used the p2p subgraph; others used CoinGecko). It only
+affected the pre-submit "≈ X" estimate, not the charged price, so it was never
+the cause of this bug. It has since been removed entirely (see
+[App-side changes already shipped](#app-side-changes-already-shipped)):
+`lib/rates.ts` now sources every currency from the on-chain p2p price, with no
+external FX at all.
 
 ---
 
@@ -101,19 +115,63 @@ entrypoint in this repo — it lives protocol-side). Required:
    *if* that is actually correct — verify against the live ARS market) plus its
    threshold and fee. Until then, ARS should be treated as unavailable.
 
-### App-side mitigations (defensive, until the data is fixed)
+### App-side mitigations still worth doing (defensive, until the data is fixed)
 
-These don't fix the price but stop the app from presenting a broken one:
+These don't fix the price but stop the app from presenting a broken one — NOT
+yet implemented:
 
-- **Gate unpriced / mispriced currencies in the terminal.** `fetchPriceConfig`
-  already returns `null` when `buyPrice <= 0` — the qr page could hide or
-  disable any currency whose on-chain price is missing (catches ARS today) and
-  optionally sanity-check the on-chain rate against the market reference
-  (`lib/rates.ts`), warning the merchant when they diverge by more than, say,
-  3× (catches BRL today).
-- **Surface the divergence** rather than silently charging it: if
-  `onchainRate / marketRate > N`, show "pricing unavailable for this currency —
-  contact support" instead of a checkout.
+- **Gate unpriced currencies in the terminal.** `fetchPriceConfig` returns
+  `null` when `buyPrice <= 0`, so the qr page could hide/disable any currency
+  with no on-chain price (catches **ARS** today, which is still selectable).
+- **Warn on a mispriced currency.** Sanity-check the on-chain rate against a
+  reference and surface "pricing unavailable — contact support" when they
+  diverge wildly (would catch **BRL** at 1000 today). Note: since the app no
+  longer fetches an external reference rate (see below), this check would need a
+  hardcoded plausibility band per currency, or a re-introduced read-only
+  reference used *only* for the sanity check (never for charging).
+
+---
+
+## App-side changes already shipped
+
+Since this issue was filed, the following app-side work landed on
+`rebranded-app`. **None of it fixes the underlying wrong on-chain price** — that
+is still protocol-side — but together they make the app self-consistent and stop
+compounding the confusion:
+
+1. **Removed the external FX rate; one p2p rate everywhere.**
+   `lib/rates.ts` no longer calls CoinGecko. `fetchUsdcRate(country, side)` now
+   sources every currency from the on-chain p2p price (`getPriceConfig`), then
+   the p2p subgraph settled-order average, then a static offline fallback — no
+   external exchange API. Previously the Accept/Withdraw pages showed a *market*
+   rate while checkout charged the *on-chain* rate, so the merchant saw two
+   different numbers for the same currency (worst on BRL). Now the estimate the
+   merchant sees matches what the widget charges. On testnet the on-chain rate
+   may be economically "wrong" (BRL 1000) — but it's shown consistently, which
+   was the explicit intent.
+
+2. **Dashboard & Withdraw now value USDC at the SELL price.**
+   `PriceConfig` now carries `sellPrice`; `fetchUsdcRate(country, "sell")` is
+   used on the dashboard and withdraw pages so "your balance is worth ≈ X" and
+   "you'll withdraw ≈ X" reflect the merchant cash-OUT rate (sell), while the
+   Accept page keeps the customer BUY rate. Live values: INR buy 91 / sell 89,
+   BRL buy 1000 / sell 990.
+
+3. **Fixed BRL/ARS amount-typing denomination.**
+   The live keypad display (`fmtTyped` in `app/qr/page.tsx`) formatted the
+   integer part with `toLocaleString(locale)`, so for `pt-BR`/`es-AR` (which use
+   "." as the THOUSANDS separator) "1000" rendered as "1.000" — reading like a
+   decimal, and "1000.50" became the ambiguous "1.000.50" colliding with the
+   keypad's "." decimal key. It now always groups with a comma and keeps "." as
+   the decimal ("1,000" / "1,000.50"), unambiguous and consistent with what was
+   typed. (`fmtFiat`, used for settled/quoted values, stays locale-aware — there
+   "R$1.000" for one thousand is the *correct* Brazilian convention.)
+
+4. **Resume screen shows the session's own currency.**
+   The "Payment in progress" panel formatted the pending amount with the current
+   `country`, which can revert to the merchant's home currency on remount — so a
+   BRL/ARS session could show the ₹ symbol / INR grouping. It now resolves and
+   formats in the currency the session was started in.
 
 ---
 
@@ -152,8 +210,10 @@ ARS buyPrice 0 = 0 fiat/USDC               <-- UNCONFIGURED
 
 ## Files referenced
 
-- `frontend/lib/pricing.ts` — on-chain price read + `usdcForFiat` inversion (generic, correct)
-- `frontend/lib/rates.ts` — market-rate *reference* only; INR uses subgraph, others CoinGecko
-- `frontend/app/qr/page.tsx` — Accept-page estimate (uses on-chain price, generic)
+- `frontend/lib/pricing.ts` — on-chain price read (`buyPrice` + now `sellPrice`) + `usdcForFiat` inversion (generic, correct)
+- `frontend/lib/rates.ts` — USDC→fiat rate; now p2p-only (`getPriceConfig` → subgraph → static), `side: "buy" | "sell"`; no external FX
+- `frontend/app/qr/page.tsx` — Accept-page estimate (on-chain buy price); `fmtTyped` denomination fix; resume-currency fix
+- `frontend/app/dashboard/page.tsx` — balance valuation, now at the sell price
+- `frontend/app/withdraw/page.tsx` — withdraw estimate + fiat→USDC sizing, now at the sell price
 - `frontend/components/CheckoutWidget.tsx` — passes `usdcAmount` to the p2p widget
 - `node_modules/@p2pdotme/widgets/dist/checkout.js` — widget's fiat/fee formula (the display math)

@@ -100,7 +100,9 @@ export default function Dashboard() {
   useEffect(() => {
     if (!country) return;
     let on = true;
-    fetchUsdcRate(country).then((r) => on && setRate(r)).catch(() => {});
+    // "sell" price: the dashboard values the merchant's USDC balance at what
+    // they'd RECEIVE cashing out to fiat (not the customer-facing buy price).
+    fetchUsdcRate(country, "sell").then((r) => on && setRate(r)).catch(() => {});
     return () => { on = false; };
   }, [country]);
 

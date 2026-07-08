@@ -77,16 +77,29 @@ export async function fetchUsdcInrRate() {
  * USDC→local rate for a country, sourced ONLY from the p2p protocol (on-chain
  * price first, then settled-order average, then a static fallback). Returns
  * { rate, source, at }.
+ *
+ * `side` selects which on-chain leg to value USDC at:
+ *   • "buy"  (default) — what a CUSTOMER pays at checkout. Use on the Accept
+ *     page so the estimate matches the charge.
+ *   • "sell" — what a MERCHANT receives cashing USDC OUT to fiat. Use on the
+ *     dashboard / withdraw so "your balance is worth ≈ X" and "you'll withdraw
+ *     ≈ X" reflect the real payout rate (sell < buy by the protocol spread).
+ * The subgraph/static fallbacks are the same either way (they're the only rate
+ * available when the on-chain price is missing).
  */
-export async function fetchUsdcRate(country) {
+export async function fetchUsdcRate(country, side: "buy" | "sell" = "buy") {
   const code = country?.code || "INR";
 
-  // 1) On-chain buyPrice — the exact rate checkout/withdrawal use. This is what
-  //    keeps every screen's fiat figure equal to the real charge.
+  // 1) On-chain price for the requested side. buyPrice = checkout charge;
+  //    sellPrice = merchant cash-out payout. Keeps every screen's fiat figure
+  //    equal to the real rate for that action.
   try {
     const cfg = await fetchPriceConfig(code);
-    if (cfg && cfg.buyPrice > 0n) {
-      return { rate: Number(cfg.buyPrice) / 1e6, source: "p2p on-chain price", at: Date.now() };
+    if (cfg) {
+      const onchain = side === "sell" ? cfg.sellPrice : cfg.buyPrice;
+      if (onchain > 0n) {
+        return { rate: Number(onchain) / 1e6, source: `p2p on-chain ${side} price`, at: Date.now() };
+      }
     }
   } catch {}
 

@@ -41,7 +41,8 @@ const PRICE_ABI = parseAbi([
 const reader = createPublicClient({ chain: ACTIVE_CHAIN, transport: http(RPC_URL) });
 
 export type PriceConfig = {
-  buyPrice: bigint;            // 6-dec fiat per USDC
+  buyPrice: bigint;            // 6-dec fiat per USDC — what a CUSTOMER pays to buy (checkout)
+  sellPrice: bigint;           // 6-dec fiat per USDC — what a MERCHANT gets cashing OUT (withdraw)
   smallOrderThreshold: bigint; // 6-dec USDC; orders <= this pay the fixed fee
   smallOrderFixedFee: bigint;  // 6-dec USDC (BUY pays half the unified fee)
 };
@@ -86,9 +87,11 @@ export async function fetchPriceConfig(code: string): Promise<PriceConfig | null
       readBuyFixedFee(currencyHex),
     ]);
     const buyPrice = (price as any).buyPrice as bigint;
+    const sellPrice = ((price as any).sellPrice as bigint) ?? 0n;
     if (!buyPrice || buyPrice <= 0n) return null;
     return {
       buyPrice,
+      sellPrice,
       smallOrderThreshold: threshold as bigint,
       smallOrderFixedFee: fixedFee,
     };

@@ -46,17 +46,11 @@ function purgeCrossAccountState(currentAddr: string) {
  */
 const AUTH_OPTIONS = [
   "email",
-  "phone",
   "google",
-  "apple",
-  "facebook",
-  "discord",
-  "x",
-  "telegram",
-  "farcaster",
-  // "passkey" and "guest" intentionally omitted: guest accounts let anyone spin
-  // up throwaway identities (fraud-account vector), and passkey confused genuine
-  // users about which method to pick. Keep the login to real email/phone/social.
+  // Only email + Google are offered. Phone and the other social providers
+  // (apple/facebook/discord/x/telegram/farcaster) are intentionally omitted to
+  // keep the login simple, and "passkey"/"guest" are excluded too (guest lets
+  // anyone spin up throwaway identities — a fraud-account vector).
 ] as const;
 
 /**

@@ -50,6 +50,11 @@ export default function Withdraw() {
   const [cashout, setCashout] = useState(null); // active fiat cash-out (Cashout widget)
   const [payoutChoice, setPayoutChoice] = useState("saved"); // "saved" | "new"
   const [newPayout, setNewPayout] = useState("");
+  // USDC-withdraw multi-step flow: null (form) → "address" (review destination)
+  //   → "confirm" (final dialog) → success (`done` set). The amount to send is
+  // captured when entering the flow so it can't shift underneath the merchant.
+  const [usdcStep, setUsdcStep] = useState<null | "address" | "confirm">(null);
+  const [usdcSend, setUsdcSend] = useState<{ raw: bigint; usdc: number }>({ raw: 0n, usdc: 0 });
 
   useEffect(() => { const c = loadCountry(); setCountry(c); setWdCode(c.code); }, []);
 
@@ -252,20 +257,30 @@ export default function Withdraw() {
       return;
     }
 
-    // USDC: direct on-chain transfer to the merchant's own wallet — no LP, no
-    // encryption. Fully self-contained.
-    setBusy(kind);
+    // USDC: don't send immediately — capture the amount and step through
+    // review (destination address) → confirm dialog → send. The transfer goes
+    // to the merchant's OWN connected wallet (withdrawUSDC → msg.sender).
+    setUsdcSend({ raw, usdc: sendUsdc });
+    setUsdcStep("address");
+  }
+
+  // Final on-chain USDC send, fired from the confirm dialog.
+  async function confirmUsdcWithdraw() {
+    setError("");
+    setBusy("usdc");
     try {
-      const { data } = buildUsdcWithdraw({ amountRaw: raw });
+      const { data } = buildUsdcWithdraw({ amountRaw: usdcSend.raw });
       const hash = await sendTransaction({ to: CONTRACT_ADDRESS, data });
       const receipt = await publicClient.waitForTransactionReceipt({ hash });
       if (receipt.status === "reverted") throw new Error("Withdrawal failed on-chain.");
+      setUsdcStep(null);
       setDone(
-        `${sendUsdc.toFixed(2)} USDC sent to your wallet ${address ? `(${address.slice(0,6)}…${address.slice(-4)})` : ""}. If you don't see it, add the USDC token to your wallet.`
+        `${usdcSend.usdc.toFixed(2)} USDC sent to your wallet ${address ? `(${address.slice(0,6)}…${address.slice(-4)})` : ""}. If you don't see it, add the USDC token to your wallet.`
       );
       setAmount(""); refetch();
     } catch (err) {
       console.error(err);
+      setUsdcStep(null);
       setError(friendlyError(err, "Withdrawal failed. Please try again."));
     } finally {
       setBusy("");
@@ -289,9 +304,34 @@ export default function Withdraw() {
         />
       )}
       <div className="screen">
+        {/* USDC WITHDRAW — STEP 2: review the destination wallet before sending.
+            The transfer goes to the merchant's OWN connected wallet, shown here
+            (read-only) so they can confirm exactly where it lands. */}
+        {usdcStep === "address" && (
+          <div className="wd-usdc-step">
+            <button className="wallet-back" onClick={() => { setUsdcStep(null); setError(""); }}>
+              <Icon.Back width="16" height="16" /> {t("wd.usdcTitle")}
+            </button>
+            <div className="wd-usdc-amt">
+              <span className="wd-usdc-amt-val">{usdcSend.usdc.toFixed(2)} USDC</span>
+              <span className="wd-usdc-amt-sub">{t("wd.usdcToWallet")}</span>
+            </div>
+            <label className="wallet-label">{t("wd.destAddress")}</label>
+            <div className="wd-usdc-addr">
+              {address || "…"}
+            </div>
+            <p className="wallet-hint" style={{ marginTop: 8 }}>{t("wd.usdcOwnWalletNote")}</p>
+            {error && <p className="error" style={{ textAlign: "center", marginTop: 10 }}>{error}</p>}
+            <button className="btn" style={{ width: "100%", marginTop: 16 }}
+              disabled={!address || !!busy} onClick={() => setUsdcStep("confirm")}>
+              {t("common.continue")}
+            </button>
+          </div>
+        )}
+
         {/* In-flight withdrawal warning — a new fiat withdraw is blocked while one
             is unsettled. Explain it and offer a self-service recover. */}
-        {inFlight > 0 && (
+        {!usdcStep && inFlight > 0 && (
           <div className="wd-inflight" style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 14px", borderRadius: 12, border: "1px solid var(--warn-border, #e0b100)", background: "var(--warn-soft, rgba(224,177,0,.08))", marginBottom: 12 }}>
             <span><Icon.Clock /></span>
             <div style={{ flex: 1 }}>
@@ -305,6 +345,9 @@ export default function Withdraw() {
           </div>
         )}
 
+        {/* The withdraw FORM — hidden while stepping through the USDC flow. */}
+        {!usdcStep && (
+        <>
         {/* TWO balance figures, side by side, so the merchant sees at a glance
             what they HAVE (account balance = everything in the contract) vs what
             they can withdraw RIGHT NOW (matured/unlocked). The gap is funds still
@@ -432,42 +475,70 @@ export default function Withdraw() {
 
         {error && <p className="error" style={{ textAlign: "center" }}>{error}</p>}
         {done && <p className="success" style={{ textAlign: "center" }}>✓ {done}</p>}
+
+        {/* If the merchant typed a fiat amount but the USDC↔fiat rate hasn't loaded,
+            we can't convert it yet — show a hint and disable withdraw (rather than
+            coercing the conversion to 0 and rejecting a valid amount). An empty
+            (MAX) input needs no rate, so it stays enabled. */}
+        {typedFiat !== "" && !rate && (
+          <p className="muted" style={{ textAlign: "center", fontSize: 12, marginTop: 10 }}>{t("wd.fetchingRate")}</p>
+        )}
+
+        {/* TWO co-equal withdrawal destinations — bank (fiat) OR wallet (USDC).
+            In normal flow (not a fixed bar) so the whole page scrolls and nothing
+            is hidden behind it. */}
+        <div className="wd-dest-bar">
+          <div className="wd-dest-head">{t("wd.chooseDest")}</div>
+          <button className="wd-dest-btn"
+            disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !rate)}
+            onClick={() => withdraw("fiat")}>
+            <span className="wd-dest-ico"><Icon.Bank /></span>
+            <span className="wd-dest-txt">
+              <b>{busy === "fiat" ? t("wd.working") : `${t("wd.sendToBank")} ${wdCountry?.fiat}`}</b>
+              <small>{t("wd.destBankHint")}</small>
+            </span>
+            <span className="wd-dest-arrow">›</span>
+          </button>
+          <button className="wd-dest-btn usdc"
+            disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !rate)}
+            onClick={() => withdraw("usdc")}>
+            <span className="wd-dest-ico"><Icon.Wallet /></span>
+            <span className="wd-dest-txt">
+              <b>{t("wd.usdcTitle")}</b>
+              <small>{t("wd.destUsdcHint")}</small>
+            </span>
+            <span className="wd-dest-arrow">›</span>
+          </button>
+        </div>
+        </>
+        )}
       </div>
 
-      {/* If the merchant typed a fiat amount but the USDC↔fiat rate hasn't loaded,
-          we can't convert it yet — show a hint and disable withdraw (rather than
-          coercing the conversion to 0 and rejecting a valid amount). An empty
-          (MAX) input needs no rate, so it stays enabled. */}
-      {typedFiat !== "" && !rate && (
-        <p className="muted" style={{ textAlign: "center", fontSize: 12 }}>{t("wd.fetchingRate")}</p>
+      {/* USDC WITHDRAW — STEP 3: final confirm dialog before the on-chain send. */}
+      {usdcStep === "confirm" && (
+        <div className="confirm-overlay" onClick={() => busy ? null : setUsdcStep("address")}>
+          <div className="confirm-sheet" onClick={(e) => e.stopPropagation()}>
+            <div className="confirm-h">{t("wd.usdcConfirmTitle")}</div>
+            <div className="confirm-amt">{usdcSend.usdc.toFixed(2)} USDC</div>
+            <p className="confirm-sub">
+              {t("wd.usdcConfirmBody")}
+            </p>
+            <div className="confirm-row">
+              <span>{t("wd.destAddress")}</span>
+              <b>{address ? `${address.slice(0, 8)}…${address.slice(-6)}` : "—"}</b>
+            </div>
+            {error && <p className="error" style={{ textAlign: "center", marginTop: 8 }}>{error}</p>}
+            <div className="confirm-actions">
+              <button className="btn ghost" disabled={!!busy} onClick={() => setUsdcStep("address")}>
+                {t("common.cancel")}
+              </button>
+              <button className="btn" disabled={!!busy} onClick={confirmUsdcWithdraw}>
+                {busy === "usdc" ? t("wd.working") : t("wd.usdcConfirmCta")}
+              </button>
+            </div>
+          </div>
+        </div>
       )}
-
-      {/* TWO co-equal withdrawal destinations — bank (fiat) OR wallet (USDC).
-          Presented as labeled cards so the USDC option is clearly visible and
-          not mistaken for a fiat-only flow. */}
-      <div className="bottombar wd-dest-bar" style={{ flexDirection: "column", gap: 10 }}>
-        <div className="wd-dest-head">{t("wd.chooseDest")}</div>
-        <button className="wd-dest-btn"
-          disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !rate)}
-          onClick={() => withdraw("fiat")}>
-          <span className="wd-dest-ico"><Icon.Bank /></span>
-          <span className="wd-dest-txt">
-            <b>{busy === "fiat" ? t("wd.working") : `${t("wd.sendToBank")} ${wdCountry?.fiat}`}</b>
-            <small>{t("wd.destBankHint")}</small>
-          </span>
-          <span className="wd-dest-arrow">›</span>
-        </button>
-        <button className="wd-dest-btn usdc"
-          disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !rate)}
-          onClick={() => withdraw("usdc")}>
-          <span className="wd-dest-ico"><Icon.Wallet /></span>
-          <span className="wd-dest-txt">
-            <b>{busy === "usdc" ? t("wd.working") : t("wd.keepUsdc")}</b>
-            <small>{t("wd.destUsdcHint")}</small>
-          </span>
-          <span className="wd-dest-arrow">›</span>
-        </button>
-      </div>
     </>
   );
 }

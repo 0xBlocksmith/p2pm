@@ -214,11 +214,16 @@ body {
 .balance-amount { font-size: 46px; font-weight: 800; letter-spacing: -1.8px; margin: 6px 0 2px; line-height: 1; }
 .balance-sub { color: rgba(255,255,255,0.82); font-size: 13.5px; font-weight: 500; }
 
-.quick { display: flex; justify-content: space-between; gap: 10px; margin: 20px 0 6px; }
+.quick { display: flex; justify-content: space-between; align-items: flex-start; gap: 10px; margin: 20px 0 6px; }
 .quick-item {
   flex: 1; display: flex; flex-direction: column; align-items: center; gap: 9px;
   text-decoration: none; color: var(--muted); font-size: 12px; font-weight: 650; cursor: pointer;
+  text-align: center;
 }
+/* Keep every tile's label on one line so the icon row stays perfectly aligned
+   across all four tiles (longer labels like "Withdraw"/"Activity" no longer wrap
+   and push their icon down). */
+.quick-item > span:last-child { white-space: nowrap; line-height: 1.1; }
 .quick-ico {
   width: 56px; height: 56px; border-radius: var(--r-lg);
   display: flex; align-items: center; justify-content: center;
@@ -249,7 +254,11 @@ body {
 }
 .barbtn {
   display: flex; align-items: center; justify-content: center; gap: 8px;
+  line-height: 1;
 }
+/* keep the leading icon optically centred with the label — SVGs carry a
+   baseline gap that nudges them off-centre inside the flex row otherwise. */
+.barbtn > svg { flex: 0 0 auto; display: block; }
 .barbtn:first-child { flex: 0 0 42%; }   /* Withdraw — secondary, narrower */
 .barbtn:last-child  { flex: 1; }          /* Accept — primary, wider */
 
@@ -1836,18 +1845,8 @@ h1 { font-size: 22px; }
   background: var(--panel); color: var(--text); display: flex; align-items: center;
   justify-content: center; cursor: pointer;
 }
-/* Hide the p2p widget's own hardcoded "P2P Checkout"/"P2P Withdraw" header (it
-   has no title-override prop) so our branded PayQR header below can stand in.
-   The widget renders content as: card > contentWrapper > header(first child). */
-.checkout-fullscreen > div:last-child > div:first-child > div:first-child { display: none; }
-/* Our branded header, rendered in the wrapper in place of the widget's. */
-.checkout-fullscreen-head {
-  display: flex; align-items: center; gap: 10px;
-  padding: 16px 24px; border-bottom: var(--border-w) solid var(--border);
-  flex: none;
-}
-.checkout-fullscreen-head .cf-mark { flex: none; }
-.checkout-fullscreen-head b { font-size: 17px; font-weight: 700; }
+/* The p2p widget renders its own header — we no longer overlay a branded PayQR
+   header, so the widget's native checkout shows full-screen, edge to edge. */
 
 /* ── Two-value balance split (Account balance | Withdrawable) — shared by the
    withdraw page and the dashboard. One neutral card, divider line between the
@@ -1880,7 +1879,10 @@ h1 { font-size: 22px; }
   border-radius: 10px; padding: 8px 12px; margin: 4px 0 6px;
 }
 
-/* ── Withdraw: two co-equal destination buttons (bank / USDC wallet) ── */
+/* ── Withdraw: two co-equal destination buttons (bank / USDC wallet).
+   In normal document flow so the whole page scrolls — NOT a fixed bottom bar
+   (it's too tall now and was hiding content behind it). ── */
+.wd-dest-bar { display: flex; flex-direction: column; gap: 10px; margin-top: 20px; }
 .wd-dest-head { font-size: 12px; font-weight: 700; color: var(--muted); letter-spacing: 0.3px; text-transform: uppercase; }
 .wd-dest-btn {
   width: 100%; display: flex; align-items: center; gap: 12px;
@@ -1925,3 +1927,38 @@ body {
    fixed nav/bottombar into the inset area so nothing is occluded. */
 .nav { padding-top: max(env(safe-area-inset-top), 12px); }
 .bottombar { padding-bottom: max(env(safe-area-inset-bottom), 14px); }
+
+/* ── Withdraw → USDC: address-review step ── */
+.wd-usdc-step { padding-top: 4px; }
+.wd-usdc-amt { text-align: center; margin: 8px 0 20px; }
+.wd-usdc-amt-val { display: block; font-size: 34px; font-weight: 800; letter-spacing: -1px; color: var(--text); }
+.wd-usdc-amt-sub { display: block; font-size: 13px; color: var(--muted); margin-top: 2px; }
+.wd-usdc-addr {
+  font-family: var(--font-mono, ui-monospace, monospace); font-size: 13px; word-break: break-all;
+  background: var(--panel-2, var(--panel)); border: var(--border-w) solid var(--border);
+  border-radius: 12px; padding: 12px 14px; margin-top: 8px; color: var(--text);
+}
+
+/* ── Generic confirm dialog (USDC withdraw confirmation) ── */
+.confirm-overlay {
+  position: fixed; inset: 0; z-index: 180; background: rgba(15,15,30,0.5);
+  display: flex; align-items: center; justify-content: center; padding: 24px;
+  animation: fadeIn .15s ease;
+}
+.confirm-sheet {
+  width: 100%; max-width: 360px; background: var(--panel);
+  border: var(--border-w) solid var(--border); border-radius: 20px;
+  padding: 24px 22px; text-align: center;
+}
+.confirm-h { font-size: 17px; font-weight: 700; color: var(--text); }
+.confirm-amt { font-size: 30px; font-weight: 800; letter-spacing: -1px; color: var(--text); margin: 10px 0 4px; }
+.confirm-sub { font-size: 13.5px; color: var(--muted); line-height: 1.55; margin: 4px 0 16px; }
+.confirm-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  font-size: 13px; padding: 12px 14px; border-radius: 12px;
+  background: var(--panel-2, var(--panel)); border: var(--border-w) solid var(--border);
+}
+.confirm-row span { color: var(--muted); }
+.confirm-row b { color: var(--text); font-family: var(--font-mono, ui-monospace, monospace); font-size: 12.5px; }
+.confirm-actions { display: flex; gap: 10px; margin-top: 18px; }
+.confirm-actions .btn { flex: 1; }

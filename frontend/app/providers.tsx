@@ -8,6 +8,8 @@ import { ACTIVE_CHAIN, RPC_URL } from "../lib/chain";
 import { thirdwebClient } from "../lib/thirdweb";
 import { appWallets } from "../components/useAuth";
 import { ThemeProvider } from "../components/theme";
+import { AppUpdateProvider } from "../components/AppUpdate";
+import { UpdateBanner } from "../components/UpdateBanner";
 
 /**
  * thirdweb owns WALLET + AUTH + gasless smart account (see lib/thirdweb.ts,
@@ -53,7 +55,12 @@ export function Providers({ children }: { children: React.ReactNode }) {
                 reconstructing the SAME smart account (appWallets carries the
                 EIP-4337 + sponsorGas config). */}
             <AutoConnect client={thirdwebClient} wallets={appWallets} />
-            {children}
+            {/* Registers the service worker and drives OTA update detection;
+                UpdateBanner shows the global "update ready · refresh" toast. */}
+            <AppUpdateProvider>
+              {children}
+              <UpdateBanner />
+            </AppUpdateProvider>
           </ThirdwebProvider>
         </WagmiProvider>
       </QueryClientProvider>

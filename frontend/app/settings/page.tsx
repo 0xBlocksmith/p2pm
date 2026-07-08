@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "../../components/useAuth";
 import { useReadContract, usePublicClient } from "wagmi";
@@ -15,6 +15,7 @@ import {
   COUNTRIES, LANGUAGES, loadCountry, loadLang, saveCountry, saveLang, clearLocalUserData,
 } from "../../lib/countries";
 import { useTheme } from "../../components/theme";
+import { useAppUpdate } from "../../components/AppUpdate";
 import { useT } from "../../lib/i18n";
 
 const THEMES = [
@@ -32,7 +33,20 @@ export default function Settings() {
   const { address, sendTransaction } = useSmartAccount(); // same source the account menu uses
   const publicClient = usePublicClient();
   const { theme, setTheme } = useTheme();
+  const { updateReady, checking, checkNow, applyUpdate } = useAppUpdate();
   const { t, lang, setLang } = useT();
+  // Show a brief "up to date ✓" confirmation after a manual check that finds
+  // nothing new (checking flips true→false with no update surfaced).
+  const [checkedClean, setCheckedClean] = useState(false);
+  const wasChecking = useRef(false);
+  useEffect(() => {
+    if (wasChecking.current && !checking && !updateReady) {
+      setCheckedClean(true);
+      const id = setTimeout(() => setCheckedClean(false), 2500);
+      return () => clearTimeout(id);
+    }
+    wasChecking.current = checking;
+  }, [checking, updateReady]);
   const [country, setCountry] = useState(null);
   const [copied, setCopied] = useState(false);
 
@@ -201,6 +215,26 @@ export default function Settings() {
               );
             })}
           </div>
+        </div>
+
+        {/* App / OTA updates */}
+        <div className="set-group">
+          <div className="set-glabel">{t("set.app")}</div>
+          {updateReady ? (
+            <button className="set-update-row ready" onClick={applyUpdate}>
+              <span className="set-ico"><Icon.Repeat width="18" height="18" /></span>
+              <span className="set-update-txt">{t("ota.updateReady")}</span>
+              <span className="set-update-cta">{t("ota.refresh")} ↻</span>
+            </button>
+          ) : (
+            <button className="set-update-row" disabled={checking} onClick={checkNow}>
+              <span className={`set-ico ${checking ? "spin" : ""}`}><Icon.Repeat width="18" height="18" /></span>
+              <span className="set-update-txt">
+                {checking ? t("ota.checking") : checkedClean ? t("ota.upToDate") : t("ota.checkUpdates")}
+              </span>
+              <span className="set-update-ver">v1.0</span>
+            </button>
+          )}
         </div>
 
         <button

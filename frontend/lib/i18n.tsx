@@ -201,6 +201,16 @@ const en: Dict = {
   "wallet.connectDapp": "Connect to a dApp",
   "wallet.manage": "Manage Wallet",
   "wallet.disconnect": "Disconnect Wallet",
+  // OTA / app updates
+  "set.app": "APP",
+  "ota.available": "A new version of PayQR is ready.",
+  "ota.refresh": "Refresh",
+  "ota.updating": "Updating…",
+  "ota.later": "Later",
+  "ota.checkUpdates": "Check for updates",
+  "ota.checking": "Checking…",
+  "ota.upToDate": "You're up to date ✓",
+  "ota.updateReady": "Update ready — tap to refresh",
 };
 
 const hi: Dict = {
@@ -345,6 +355,14 @@ const hi: Dict = {
   "wallet.connectDapp": "किसी dApp से कनेक्ट करें",
   "wallet.manage": "वॉलेट प्रबंधित करें",
   "wallet.disconnect": "वॉलेट डिस्कनेक्ट करें",
+  "ota.available": "PayQR का नया संस्करण तैयार है।",
+  "ota.refresh": "रीफ़्रेश करें",
+  "ota.updating": "अपडेट हो रहा है…",
+  "ota.later": "बाद में",
+  "ota.checkUpdates": "अपडेट जाँचें",
+  "ota.checking": "जाँच हो रही है…",
+  "ota.upToDate": "आप अद्यतित हैं ✓",
+  "ota.updateReady": "अपडेट तैयार — रीफ़्रेश करने हेतु टैप करें",
 };
 
 const pt: Dict = {
@@ -489,6 +507,14 @@ const pt: Dict = {
   "wallet.connectDapp": "Conectar a um dApp",
   "wallet.manage": "Gerenciar carteira",
   "wallet.disconnect": "Desconectar carteira",
+  "ota.available": "Uma nova versão do PayQR está pronta.",
+  "ota.refresh": "Atualizar",
+  "ota.updating": "Atualizando…",
+  "ota.later": "Depois",
+  "ota.checkUpdates": "Verificar atualizações",
+  "ota.checking": "Verificando…",
+  "ota.upToDate": "Você está atualizado ✓",
+  "ota.updateReady": "Atualização pronta — toque para atualizar",
 };
 
 const es: Dict = {
@@ -633,6 +659,14 @@ const es: Dict = {
   "wallet.connectDapp": "Conectar a una dApp",
   "wallet.manage": "Gestionar billetera",
   "wallet.disconnect": "Desconectar billetera",
+  "ota.available": "Una nueva versión de PayQR está lista.",
+  "ota.refresh": "Actualizar",
+  "ota.updating": "Actualizando…",
+  "ota.later": "Después",
+  "ota.checkUpdates": "Buscar actualizaciones",
+  "ota.checking": "Buscando…",
+  "ota.upToDate": "Estás al día ✓",
+  "ota.updateReady": "Actualización lista — toca para actualizar",
 };
 
 const DICTS: Record<Lang, Dict> = { en, hi, pt, es };

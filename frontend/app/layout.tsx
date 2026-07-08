@@ -40,12 +40,9 @@ export default function RootLayout({ children }) {
         <link rel="dns-prefetch" href="https://c.thirdweb.com" />
         <link rel="preconnect" href="https://embedded-wallet.thirdweb.com" crossOrigin="" />
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
-        {/* Register the service worker so the app is installable (PWA). */}
-        <script
-          dangerouslySetInnerHTML={{
-            __html: `if('serviceWorker' in navigator){window.addEventListener('load',function(){navigator.serviceWorker.register('/sw.js').catch(function(){})})}`,
-          }}
-        />
+        {/* Service-worker registration + OTA update detection is handled by
+            <AppUpdateProvider> (see components/AppUpdate.tsx), so the app can
+            surface an "update ready" prompt rather than swapping silently. */}
       </head>
       <body>
         <Providers>{children}</Providers>

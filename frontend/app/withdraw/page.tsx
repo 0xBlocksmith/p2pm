@@ -78,7 +78,9 @@ export default function Withdraw() {
   useEffect(() => {
     if (!country) return;
     let on = true;
-    fetchUsdcRate(country).then((r) => on && setRate(r)).catch(() => {});
+    // "sell" price: withdrawal converts the merchant's USDC → fiat, so the
+    // "≈ X" figures must use the cash-OUT rate, not the customer buy price.
+    fetchUsdcRate(country, "sell").then((r) => on && setRate(r)).catch(() => {});
     return () => { on = false; };
   }, [country]);
 

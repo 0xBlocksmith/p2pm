@@ -6,7 +6,7 @@ import { useCheckoutSigner } from "./useCheckoutSigner";
 import { useRelayIdentity } from "./useRelayIdentity";
 import { makePlaceOrder, SUBGRAPH_URL, USDC_ADDRESS, DIAMOND_ADDRESS, CURRENCIES } from "../lib/p2p";
 import { ACTIVE_CHAIN } from "../lib/chain";
-import { Icon, Logo } from "./Icons";
+import { Icon } from "./Icons";
 
 /**
  * Live UPI checkout via the official p2p.me widget. The widget generates the
@@ -50,10 +50,6 @@ export function CheckoutWidget({ orderId, usdcAmount, quantity, productName, cur
 
   return (
     <div className="checkout-fullscreen">
-      <div className="checkout-fullscreen-head">
-        <Logo size={24} className="cf-mark" />
-        <b>PayQR Checkout</b>
-      </div>
       {onClose && (
         <button className="checkout-fullscreen-close" onClick={onClose} aria-label="Close">
           <Icon.Close />

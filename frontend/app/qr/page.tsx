@@ -76,7 +76,8 @@ export default function PosQr() {
   const [amt, setAmt] = useState("");        // local fiat the merchant types
   const [lastAmt, setLastAmt] = useState(""); // for "repeat"
   const [inputMode, setInputMode] = useState<"fiat" | "usdc">("fiat"); // what `amt` is denominated in
-  const [rate, setRate] = useState(null);
+  const [rate, setRate] = useState(null);           // market rate (fallback estimate only)
+  const [priceCfg, setPriceCfg] = useState(null);   // live on-chain price for `country` — the REAL charge price
   const [error, setError] = useState("");
   const [liveWidget, setLiveWidget] = useState(null);
   const [done, setDone] = useState(null);
@@ -198,12 +199,53 @@ export default function PosQr() {
     return () => { alive = false; clearInterval(t); };
   }, [country]);
 
+  // Load the LIVE on-chain price for the selected currency — this is the rate
+  // the checkout ACTUALLY charges at (getPriceConfig buyPrice + small-order fee),
+  // which can differ from the market rate (rates.ts) by the protocol spread, or
+  // wildly if a currency's on-chain price is misconfigured. We show the estimate
+  // off THIS so the "≈ X USDC" the merchant sees before pressing Accept matches
+  // the checkout total — no more jump from 19 USDC (market) to 0.04 USDC (chain).
+  useEffect(() => {
+    if (!country) { setPriceCfg(null); return; }
+    let alive = true;
+    setPriceCfg(null); // clear stale price while the new currency's loads
+    fetchPriceConfig(country.code)
+      .then((cfg) => { if (alive) setPriceCfg(cfg ? { code: country.code, ...cfg } : { code: country.code, missing: true }); })
+      .catch(() => { if (alive) setPriceCfg({ code: country.code, missing: true }); });
+    return () => { alive = false; };
+  }, [country]);
+
+  // The on-chain buyPrice as a plain number of fiat-per-USDC, when it's for the
+  // CURRENT currency and usable. This is what both the estimate and generate()
+  // price against, so they always agree.
+  const onchainRate =
+    priceCfg && !priceCfg.missing && priceCfg.code === country?.code && priceCfg.buyPrice > 0n
+      ? Number(priceCfg.buyPrice) / 1e6
+      : null;
+  // Effective fiat-per-USDC for the pre-submit estimate: prefer the on-chain
+  // price (what checkout charges), fall back to the market rate only until it
+  // loads / if the currency has no on-chain price.
+  const estRate = onchainRate ?? (rate ? rate.rate : null);
+
   const amtNum = Number(amt) || 0;
-  // In USDC mode the typed number IS the USDC amount; in fiat mode it's derived
-  // from the estimate rate (the on-chain price is what actually sizes the order,
-  // in generate()).
-  const usdcEquiv = inputMode === "usdc" ? amtNum : (rate && amtNum > 0 ? amtNum / rate.rate : 0);
-  const fiatEquiv = inputMode === "usdc" ? (rate && amtNum > 0 ? amtNum * rate.rate : 0) : amtNum;
+  // In USDC mode the typed number IS the USDC amount. In fiat mode the estimate
+  // must match what generate()/checkout will actually charge:
+  //  • With the on-chain price loaded, run the SAME usdcForFiat() inversion the
+  //    order is sized with (it accounts for the small-order fixed fee), so the
+  //    "≈ X USDC" equals the checkout amount to the cent.
+  //  • Before that loads / for an unpriced currency, fall back to a plain
+  //    market-rate division.
+  const usdcEquiv =
+    inputMode === "usdc"
+      ? amtNum
+      : amtNum > 0
+        ? onchainRate && priceCfg && !priceCfg.missing
+          ? Number(usdcForFiat(amtNum, priceCfg)) / 1e6
+          : estRate
+            ? amtNum / estRate
+            : 0
+        : 0;
+  const fiatEquiv = inputMode === "usdc" ? (estRate && amtNum > 0 ? amtNum * estRate : 0) : amtNum;
   // Per-tx cap keys off the merchant's REGISTERED currency (what the contract
   // enforces in validateOrder), NOT the currency picked in the terminal — else
   // an INR merchant (50 cap) charging in BRL would be shown a 100 cap and the
@@ -235,22 +277,17 @@ export default function PosQr() {
 
   async function generate() {
     setError("");
-    if (!rate) return;
+    if (!estRate) return;
     if (amtNum <= 0) return setError(inputMode === "usdc" ? "Enter the amount in USDC." : `Enter the amount in ${country.code}.`);
     if (overCap) {
       return setError(
-        `Max ${capUsdc} USDC per sale (≈ ${fmtFiat(country, capUsdc * rate.rate)} now).`
+        `Max ${capUsdc} USDC per sale (≈ ${fmtFiat(country, capUsdc * estRate)} now).`
       );
     }
 
-    // Snapshot the charge currency NOW. `country` is live React state — the
-    // merchant can still tap the currency picker (or the page can remount and
-    // reset it to the registered/home country) while the on-chain price read
-    // below is in flight. Everything downstream (the priced usdcAmount, the
-    // <CheckoutWidget currencies=…> prop, the saved session) must all agree on
-    // THIS currency, not whatever `country` happens to be by the time each of
-    // them runs — otherwise the widget prices an amount sized for one currency
-    // using another currency's on-chain buyPrice, producing a wildly wrong total.
+    // Snapshot the charge currency NOW so everything downstream (the priced
+    // usdcAmount, the <CheckoutWidget currencies=…> prop, the saved session)
+    // agrees on THIS currency even if `country` changes before they run.
     const chargeCountry = country;
 
     setBusy(true);
@@ -261,14 +298,11 @@ export default function PosQr() {
       usdcTarget = BigInt(Math.round(amtNum * 1e6));
       setBusy(false);
     } else {
-      // SIZE THE USDC SO THE CUSTOMER PAYS EXACTLY WHAT THE MERCHANT QUOTED.
-      // The widget derives the customer's fiat total from the Diamond's live
-      // buyPrice (+ small-order fee), NOT from our estimate rate — so sizing off
-      // usdcEquiv (lib/rates.ts) makes a ₹500 quote render as ~₹492. Instead we
-      // read the SAME on-chain price the widget uses and invert it, so the quote,
-      // the preview, the "Pay exactly" screen and the UPI link all agree. The
-      // merchant absorbs the USDC↔fiat spread — exactly the intended behavior.
-      // Falls back to the estimate-rate math if the Diamond can't be priced.
+      // SIZE THE USDC SO THE CUSTOMER PAYS EXACTLY WHAT THE MERCHANT QUOTED,
+      // against the SAME on-chain buyPrice both the estimate above (estRate) and
+      // the checkout widget use. Re-read fresh here (the cached `priceCfg` is for
+      // display; this guarantees the order is sized against the latest on-chain
+      // value at submit time). Falls back to the estimate math if unpriceable.
       try {
         const cfg = await fetchPriceConfig(chargeCountry.code);
         usdcTarget = cfg ? usdcForFiat(amtNum, cfg) : BigInt(Math.round(usdcEquiv * 1e6));
@@ -291,7 +325,7 @@ export default function PosQr() {
     if (quantity === 0n) return setError("Amount too small.");
     const usdcAmount = quantity * 10_000n;
     const usdc = Number(usdcAmount) / 1e6;
-    const fiatCharged = inputMode === "usdc" ? usdc * rate.rate : amtNum;
+    const fiatCharged = inputMode === "usdc" ? usdc * (estRate ?? 0) : amtNum;
     setLastAmt(amt);
     setLiveWidget({ usdcAmount, quantity, fiat: fiatCharged, usdc, country: chargeCountry });
     // Persist so the session survives a closed dialog / refresh and can be resumed.
@@ -572,7 +606,7 @@ export default function PosQr() {
                 {inputMode === "usdc" ? `${fmtTyped(amt, country)} USDC` : `${country.symbol}${fmtTyped(amt, country)}`}
               </div>
               <div className="t-sub">
-                {rate
+                {estRate
                   ? amtNum > 0
                     ? inputMode === "usdc"
                       ? `≈ ${fmtFiat(country, fiatEquiv)} ${country.code}`
@@ -580,8 +614,8 @@ export default function PosQr() {
                     : t("qr.enterAmount")
                   : t("qr.fetchingRate")}
               </div>
-              {overCap && rate && (
-                <div className="t-warn">Max {fmtFiat(country, capUsdc * rate.rate)} per sale</div>
+              {overCap && estRate && (
+                <div className="t-warn">Max {fmtFiat(country, capUsdc * estRate)} per sale</div>
               )}
             </div>
 
@@ -608,7 +642,7 @@ export default function PosQr() {
 
             <button className="btn t-charge"
               style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
-              disabled={!ready || !rate || amtNum <= 0 || overCap || busy} onClick={generate}>
+              disabled={!ready || !estRate || amtNum <= 0 || overCap || busy} onClick={generate}>
               <Icon.Qr /> {busy ? t("qr.fetchingRate") : amtNum > 0 ? `${t("common.acceptPayment")} · ${inputMode === "usdc" ? `${fmtTyped(amt, country)} USDC` : `${country.symbol}${fmtTyped(amt, country)}`}` : t("common.acceptPayment")}
             </button>
             {error && <p className="error" style={{ textAlign: "center" }}>{error}</p>}

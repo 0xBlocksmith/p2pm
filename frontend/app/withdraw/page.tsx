@@ -55,6 +55,10 @@ export default function Withdraw() {
   // captured when entering the flow so it can't shift underneath the merchant.
   const [usdcStep, setUsdcStep] = useState<null | "address" | "confirm">(null);
   const [usdcSend, setUsdcSend] = useState<{ raw: bigint; usdc: number }>({ raw: 0n, usdc: 0 });
+  // Which destination the merchant is withdrawing to: chosen FIRST, before any
+  // currency/UPI UI is shown, so we don't ask USDC-bound questions about local
+  // currency (and vice versa). null = not yet chosen.
+  const [destChoice, setDestChoice] = useState<null | "fiat" | "usdc">(null);
 
   useEffect(() => { const c = loadCountry(); setCountry(c); setWdCode(c.code); }, []);
 
@@ -193,12 +197,16 @@ export default function Withdraw() {
   );
   const nextUnlockSecs = nextUnlock === Infinity ? 0 : Math.max(0, nextUnlock - now);
 
-  // The AMOUNT FIELD is now entered in LOCAL FIAT (₹ / R$ / …) — what a shopkeeper
-  // thinks in — and we convert to USDC under the hood. Empty = withdraw MAX.
+  // The AMOUNT FIELD is entered in LOCAL FIAT (₹ / R$ / …) for the bank path —
+  // what a shopkeeper thinks in — and converted to USDC under the hood. Empty =
+  // withdraw MAX. On the USDC path the same field is USDC directly, no
+  // conversion needed.
   const typedFiat = amount.trim();
   // fiat the user wants → USDC (÷ rate). Empty means "everything".
   const fiatNum = typedFiat === "" ? availFiat ?? 0 : (Number(typedFiat) || 0);
-  const usdcNum = typedFiat === "" ? availNum : (rate ? fiatNum / rate.rate : 0);
+  const usdcNum = typedFiat === ""
+    ? availNum
+    : destChoice === "usdc" ? (Number(typedFiat) || 0) : (rate ? fiatNum / rate.rate : 0);
   const overBalance = usdcNum > availNum + 1e-9;
 
   // withdraw-currency helpers
@@ -392,124 +400,175 @@ export default function Withdraw() {
           </div>
         )}
 
-        <div className="wd-card">
-          <label className="wd-label">{t("wd.amount")} ({country.code})</label>
-          <div className="wd-amt-row">
-            {/* Amount entered in LOCAL FIAT (₹/R$/…) with the currency symbol; the
-                USDC equivalent is shown small below. */}
-            <div className="wd-fiat-input" style={{ display: "flex", alignItems: "center", flex: 1, gap: 6 }}>
-              <span className="wd-fiat-sym" style={{ fontWeight: 700, color: "var(--muted)" }}>{country.symbol}</span>
-              <input className="input" type="number" min="0" step="0.01"
-                placeholder={availFiat != null ? availFiat.toFixed(2) : "0.00"} value={amount}
-                onChange={(e) => setAmount(e.target.value)} style={{ flex: 1 }} />
-            </div>
-            <button className="btn secondary small" type="button"
-              onClick={() => setAmount(availFiat != null ? availFiat.toFixed(2) : "")}>{t("wd.max")}</button>
-          </div>
-          {/* small USDC equivalent of whatever fiat is typed */}
-          <div className="wd-usdc-hint muted" style={{ fontSize: 12, marginTop: 6 }}>
-            ≈ {usdcNum > 0 ? usdcNum.toFixed(2) : availNum.toFixed(2)} USDC
-            {typedFiat === "" && <span> · {t("wd.max")}</span>}
-          </div>
-          {overBalance && <p className="error">{t("wd.exceeds")}</p>}
-        </div>
-
-        {/* WITHDRAW CURRENCY — Accept-style dropdown. Default = registered
-            country; pick another to cash out in that currency. */}
-        <div className="wd-label" style={{ marginTop: 18 }}>{t("wd.withdrawIn")}</div>
-        <div className="picker wd-cur">
-          <button className={`picker-btn ${otherOpen ? "on" : ""}`} onClick={() => setOtherOpen((o) => !o)}>
-            <img className="pk-flag-img" src={flagOf(wdCode)} alt="" />
-            <span className="pk-text">{wdCountry?.name} · {wdCountry?.symbol} {wdCode}</span>
-            <span className="pk-car">▾</span>
-          </button>
-          {otherOpen && (
-            <div className="picker-pop">
-              {otherOpts.map((c) => (
-                <button key={c.id} className={`picker-item ${wdCode === c.code ? "sel" : ""}`}
-                  onClick={() => { setWdCode(c.code); setOtherOpen(false); }}>
-                  <img className="pk-flag-img" src={flagOf(c.code)} alt="" />
-                  <span className="pk-item-txt">{c.name}<small>{c.fiat} · {c.symbol} {c.code}</small></span>
-                  {wdCode === c.code && <span className="pk-chk">✓</span>}
-                </button>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* PAYOUT DESTINATION for a fiat cash-out — pick the saved handle or enter
-            a new one. The handle is delivered ENCRYPTED by the secure cash-out
-            step; if "new" is chosen we persist it on-chain (updateProfile) before
-            opening the widget so it uses the right one. USDC withdrawal needs no
-            handle (it goes to the merchant's own wallet). */}
-        <div className="wd-card" style={{ marginTop: 14 }}>
-          <label className="wd-label">{wdCountry?.payoutLabel || "Payout ID"} ({t("wd.forBank")})</label>
-
-          {savedPayout && (
-            <button type="button"
-              className={`wd-payout-opt ${payoutChoice === "saved" ? "sel" : ""}`}
-              onClick={() => setPayoutChoice("saved")}
-              style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "10px 12px", marginTop: 8, borderRadius: 10, border: "1px solid var(--border)", background: payoutChoice === "saved" ? "var(--accent-soft, rgba(20,136,255,.08))" : "transparent", cursor: "pointer" }}>
-              <span className="wd-radio">{payoutChoice === "saved" ? "●" : "○"}</span>
-              <span style={{ flex: 1, textAlign: "left" }}>
-                <b>{t("wd.useSaved")}</b>
-                <small style={{ display: "block", color: "var(--muted)" }}>{savedPayout}</small>
+        {/* STEP 1 — ask WHERE first: local currency (bank/UPI) or USDC wallet.
+            Nothing currency- or UPI-specific is shown until this is answered,
+            so a USDC withdrawal never has to wade through fiat/UPI fields. */}
+        {!destChoice && (
+          <div className="wd-dest-bar">
+            <div className="wd-dest-head">{t("wd.chooseDest")}</div>
+            <button className="wd-dest-btn"
+              disabled={!ready || availNum <= 0}
+              onClick={() => { setAmount(""); setDestChoice("fiat"); }}>
+              <span className="wd-dest-ico"><Icon.Bank /></span>
+              <span className="wd-dest-txt">
+                <b>{t("wd.sendToBank")} {wdCountry?.fiat}</b>
+                <small>{t("wd.destBankHint")}</small>
               </span>
+              <span className="wd-dest-arrow">›</span>
             </button>
-          )}
-
-          <button type="button"
-            className={`wd-payout-opt ${payoutChoice === "new" ? "sel" : ""}`}
-            onClick={() => setPayoutChoice("new")}
-            style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "10px 12px", marginTop: 8, borderRadius: 10, border: "1px solid var(--border)", background: payoutChoice === "new" ? "var(--accent-soft, rgba(20,136,255,.08))" : "transparent", cursor: "pointer" }}>
-            <span className="wd-radio">{payoutChoice === "new" ? "●" : "○"}</span>
-            <span style={{ flex: 1, textAlign: "left" }}><b>{savedPayout ? t("wd.useNew") : t("wd.enterPayout")}</b></span>
-          </button>
-
-          {payoutChoice === "new" && (
-            <input className="input" style={{ marginTop: 10 }}
-              placeholder={wdCountry?.payoutPlaceholder || "your@upi"}
-              value={newPayout} onChange={(e) => setNewPayout(e.target.value.trim())} />
-          )}
-        </div>
-
-        {error && <p className="error" style={{ textAlign: "center" }}>{error}</p>}
-        {done && <p className="success" style={{ textAlign: "center" }}>✓ {done}</p>}
-
-        {/* If the merchant typed a fiat amount but the USDC↔fiat rate hasn't loaded,
-            we can't convert it yet — show a hint and disable withdraw (rather than
-            coercing the conversion to 0 and rejecting a valid amount). An empty
-            (MAX) input needs no rate, so it stays enabled. */}
-        {typedFiat !== "" && !rate && (
-          <p className="muted" style={{ textAlign: "center", fontSize: 12, marginTop: 10 }}>{t("wd.fetchingRate")}</p>
+            <button className="wd-dest-btn usdc"
+              disabled={!ready || availNum <= 0}
+              onClick={() => { setAmount(""); setDestChoice("usdc"); }}>
+              <span className="wd-dest-ico"><Icon.Wallet /></span>
+              <span className="wd-dest-txt">
+                <b>{t("wd.usdcTitle")}</b>
+                <small>{t("wd.destUsdcHint")}</small>
+              </span>
+              <span className="wd-dest-arrow">›</span>
+            </button>
+          </div>
         )}
 
-        {/* TWO co-equal withdrawal destinations — bank (fiat) OR wallet (USDC).
-            In normal flow (not a fixed bar) so the whole page scrolls and nothing
-            is hidden behind it. */}
-        <div className="wd-dest-bar">
-          <div className="wd-dest-head">{t("wd.chooseDest")}</div>
-          <button className="wd-dest-btn"
-            disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !rate)}
-            onClick={() => withdraw("fiat")}>
-            <span className="wd-dest-ico"><Icon.Bank /></span>
-            <span className="wd-dest-txt">
-              <b>{busy === "fiat" ? t("wd.working") : `${t("wd.sendToBank")} ${wdCountry?.fiat}`}</b>
-              <small>{t("wd.destBankHint")}</small>
-            </span>
-            <span className="wd-dest-arrow">›</span>
-          </button>
-          <button className="wd-dest-btn usdc"
-            disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !rate)}
-            onClick={() => withdraw("usdc")}>
-            <span className="wd-dest-ico"><Icon.Wallet /></span>
-            <span className="wd-dest-txt">
-              <b>{t("wd.usdcTitle")}</b>
-              <small>{t("wd.destUsdcHint")}</small>
-            </span>
-            <span className="wd-dest-arrow">›</span>
-          </button>
-        </div>
+        {/* STEP 2, fiat path — amount, withdraw currency, and UPI/payout fields.
+            Only ever shown after "Send to my UPI/bank" is chosen. */}
+        {destChoice === "fiat" && (
+          <>
+            <button className="wallet-back" onClick={() => setDestChoice(null)}>
+              <Icon.Back width="16" height="16" /> {t("wd.sendToBank")} {wdCountry?.fiat}
+            </button>
+
+            <div className="wd-card">
+              <label className="wd-label">{t("wd.amount")} ({country.code})</label>
+              <div className="wd-amt-row">
+                {/* Amount entered in LOCAL FIAT (₹/R$/…) with the currency symbol; the
+                    USDC equivalent is shown small below. */}
+                <div className="wd-fiat-input" style={{ display: "flex", alignItems: "center", flex: 1, gap: 6 }}>
+                  <span className="wd-fiat-sym" style={{ fontWeight: 700, color: "var(--muted)" }}>{country.symbol}</span>
+                  <input className="input" type="number" min="0" step="0.01"
+                    placeholder={availFiat != null ? availFiat.toFixed(2) : "0.00"} value={amount}
+                    onChange={(e) => setAmount(e.target.value)} style={{ flex: 1 }} />
+                </div>
+                <button className="btn secondary small" type="button"
+                  onClick={() => setAmount(availFiat != null ? availFiat.toFixed(2) : "")}>{t("wd.max")}</button>
+              </div>
+              {/* small USDC equivalent of whatever fiat is typed */}
+              <div className="wd-usdc-hint muted" style={{ fontSize: 12, marginTop: 6 }}>
+                ≈ {usdcNum > 0 ? usdcNum.toFixed(2) : availNum.toFixed(2)} USDC
+                {typedFiat === "" && <span> · {t("wd.max")}</span>}
+              </div>
+              {overBalance && <p className="error">{t("wd.exceeds")}</p>}
+            </div>
+
+            {/* WITHDRAW CURRENCY — Accept-style dropdown. Default = registered
+                country; pick another to cash out in that currency. */}
+            <div className="wd-label" style={{ marginTop: 18 }}>{t("wd.withdrawIn")}</div>
+            <div className="picker wd-cur">
+              <button className={`picker-btn ${otherOpen ? "on" : ""}`} onClick={() => setOtherOpen((o) => !o)}>
+                <img className="pk-flag-img" src={flagOf(wdCode)} alt="" />
+                <span className="pk-text">{wdCountry?.name} · {wdCountry?.symbol} {wdCode}</span>
+                <span className="pk-car">▾</span>
+              </button>
+              {otherOpen && (
+                <div className="picker-pop">
+                  {otherOpts.map((c) => (
+                    <button key={c.id} className={`picker-item ${wdCode === c.code ? "sel" : ""}`}
+                      onClick={() => { setWdCode(c.code); setOtherOpen(false); }}>
+                      <img className="pk-flag-img" src={flagOf(c.code)} alt="" />
+                      <span className="pk-item-txt">{c.name}<small>{c.fiat} · {c.symbol} {c.code}</small></span>
+                      {wdCode === c.code && <span className="pk-chk">✓</span>}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* PAYOUT DESTINATION for a fiat cash-out — pick the saved handle or enter
+                a new one. The handle is delivered ENCRYPTED by the secure cash-out
+                step; if "new" is chosen we persist it on-chain (updateProfile) before
+                opening the widget so it uses the right one. */}
+            <div className="wd-card" style={{ marginTop: 14 }}>
+              <label className="wd-label">{wdCountry?.payoutLabel || "Payout ID"} ({t("wd.forBank")})</label>
+
+              {savedPayout && (
+                <button type="button"
+                  className={`wd-payout-opt ${payoutChoice === "saved" ? "sel" : ""}`}
+                  onClick={() => setPayoutChoice("saved")}
+                  style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "10px 12px", marginTop: 8, borderRadius: 10, border: "1px solid var(--border)", background: payoutChoice === "saved" ? "var(--accent-soft, rgba(20,136,255,.08))" : "transparent", cursor: "pointer" }}>
+                  <span className="wd-radio">{payoutChoice === "saved" ? "●" : "○"}</span>
+                  <span style={{ flex: 1, textAlign: "left" }}>
+                    <b>{t("wd.useSaved")}</b>
+                    <small style={{ display: "block", color: "var(--muted)" }}>{savedPayout}</small>
+                  </span>
+                </button>
+              )}
+
+              <button type="button"
+                className={`wd-payout-opt ${payoutChoice === "new" ? "sel" : ""}`}
+                onClick={() => setPayoutChoice("new")}
+                style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "10px 12px", marginTop: 8, borderRadius: 10, border: "1px solid var(--border)", background: payoutChoice === "new" ? "var(--accent-soft, rgba(20,136,255,.08))" : "transparent", cursor: "pointer" }}>
+                <span className="wd-radio">{payoutChoice === "new" ? "●" : "○"}</span>
+                <span style={{ flex: 1, textAlign: "left" }}><b>{savedPayout ? t("wd.useNew") : t("wd.enterPayout")}</b></span>
+              </button>
+
+              {payoutChoice === "new" && (
+                <input className="input" style={{ marginTop: 10 }}
+                  placeholder={wdCountry?.payoutPlaceholder || "your@upi"}
+                  value={newPayout} onChange={(e) => setNewPayout(e.target.value.trim())} />
+              )}
+            </div>
+
+            {error && <p className="error" style={{ textAlign: "center" }}>{error}</p>}
+            {done && <p className="success" style={{ textAlign: "center" }}>✓ {done}</p>}
+
+            {/* If the merchant typed a fiat amount but the USDC↔fiat rate hasn't loaded,
+                we can't convert it yet — show a hint and disable withdraw (rather than
+                coercing the conversion to 0 and rejecting a valid amount). An empty
+                (MAX) input needs no rate, so it stays enabled. */}
+            {typedFiat !== "" && !rate && (
+              <p className="muted" style={{ textAlign: "center", fontSize: 12, marginTop: 10 }}>{t("wd.fetchingRate")}</p>
+            )}
+
+            <button className="btn" style={{ width: "100%", marginTop: 16 }}
+              disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !rate)}
+              onClick={() => withdraw("fiat")}>
+              {busy === "fiat" ? t("wd.working") : `${t("wd.sendToBank")} ${wdCountry?.fiat}`}
+            </button>
+          </>
+        )}
+
+        {/* STEP 2, USDC path — just the amount; destination is the merchant's own
+            connected wallet, confirmed in the next step. No fiat/UPI fields at all. */}
+        {destChoice === "usdc" && (
+          <>
+            <button className="wallet-back" onClick={() => setDestChoice(null)}>
+              <Icon.Back width="16" height="16" /> {t("wd.usdcTitle")}
+            </button>
+
+            <div className="wd-card">
+              <label className="wd-label">{t("wd.amount")} (USDC)</label>
+              <div className="wd-amt-row">
+                <div className="wd-fiat-input" style={{ display: "flex", alignItems: "center", flex: 1, gap: 6 }}>
+                  <input className="input" type="number" min="0" step="0.01"
+                    placeholder={availNum.toFixed(2)} value={amount}
+                    onChange={(e) => setAmount(e.target.value)} style={{ flex: 1 }} />
+                  <span className="wd-fiat-sym" style={{ fontWeight: 700, color: "var(--muted)" }}>USDC</span>
+                </div>
+                <button className="btn secondary small" type="button"
+                  onClick={() => setAmount(availNum.toFixed(2))}>{t("wd.max")}</button>
+              </div>
+              {overBalance && <p className="error">{t("wd.exceeds")}</p>}
+            </div>
+
+            {error && <p className="error" style={{ textAlign: "center" }}>{error}</p>}
+            {done && <p className="success" style={{ textAlign: "center" }}>✓ {done}</p>}
+
+            <button className="btn" style={{ width: "100%", marginTop: 16 }}
+              disabled={!!busy || !ready || availNum <= 0 || overBalance}
+              onClick={() => withdraw("usdc")}>
+              {t("common.continue")}
+            </button>
+          </>
+        )}
         </>
         )}
       </div>

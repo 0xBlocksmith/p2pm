@@ -147,7 +147,7 @@ export function WalletSheet({
           <div className="wsheet-id">
             <button className="wsheet-addr" onClick={copyAddr}>
               {address ? `${address.slice(0, 6)}…${address.slice(-4)}` : "…"}
-              <span className="wsheet-copy">{copied ? "✓" : <Icon.Share width="13" height="13" />}</span>
+              <span className="wsheet-copy">{copied ? "✓" : <Icon.Copy width="13" height="13" />}</span>
             </button>
             <div className="wsheet-type">Smart Account</div>
           </div>

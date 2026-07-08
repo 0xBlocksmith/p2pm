@@ -76,7 +76,7 @@ export default function PosQr() {
   const [amt, setAmt] = useState("");        // local fiat the merchant types
   const [lastAmt, setLastAmt] = useState(""); // for "repeat"
   const [inputMode, setInputMode] = useState<"fiat" | "usdc">("fiat"); // what `amt` is denominated in
-  const [rate, setRate] = useState(null);           // market rate (fallback estimate only)
+  const [rate, setRate] = useState(null);           // p2p rate (on-chain price via rates.ts); used until priceCfg loads
   const [priceCfg, setPriceCfg] = useState(null);   // live on-chain price for `country` — the REAL charge price
   const [error, setError] = useState("");
   const [liveWidget, setLiveWidget] = useState(null);
@@ -200,11 +200,10 @@ export default function PosQr() {
   }, [country]);
 
   // Load the LIVE on-chain price for the selected currency — this is the rate
-  // the checkout ACTUALLY charges at (getPriceConfig buyPrice + small-order fee),
-  // which can differ from the market rate (rates.ts) by the protocol spread, or
-  // wildly if a currency's on-chain price is misconfigured. We show the estimate
-  // off THIS so the "≈ X USDC" the merchant sees before pressing Accept matches
-  // the checkout total — no more jump from 19 USDC (market) to 0.04 USDC (chain).
+  // the checkout ACTUALLY charges at (getPriceConfig buyPrice + small-order fee).
+  // rates.ts now sources the SAME on-chain price, so the estimate and this only
+  // differ before it loads. We show the estimate off THIS so the "≈ X USDC" the
+  // merchant sees before pressing Accept matches the checkout total exactly.
   useEffect(() => {
     if (!country) { setPriceCfg(null); return; }
     let alive = true;
@@ -222,9 +221,9 @@ export default function PosQr() {
     priceCfg && !priceCfg.missing && priceCfg.code === country?.code && priceCfg.buyPrice > 0n
       ? Number(priceCfg.buyPrice) / 1e6
       : null;
-  // Effective fiat-per-USDC for the pre-submit estimate: prefer the on-chain
-  // price (what checkout charges), fall back to the market rate only until it
-  // loads / if the currency has no on-chain price.
+  // Effective fiat-per-USDC for the pre-submit estimate: prefer the freshly-read
+  // on-chain price (what checkout charges); fall back to `rate` (also the p2p
+  // on-chain price, via rates.ts) only until this dedicated read loads.
   const estRate = onchainRate ?? (rate ? rate.rate : null);
 
   const amtNum = Number(amt) || 0;

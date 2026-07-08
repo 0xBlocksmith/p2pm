@@ -252,22 +252,31 @@ body {
   box-shadow: none;
   max-width: 560px; margin: 0 auto;
 }
-.barbtn {
-  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+/* Scoped as `.btn.barbtn` (two classes) ON PURPOSE: there are later single-class
+   `.btn` blocks in this file that set `display: inline-block`, and at equal
+   specificity source order would let those win — collapsing the flex row so the
+   icon stacked above the label. Two classes out-specify every plain `.btn`, so
+   the row layout always holds regardless of where the `.btn` rules sit. */
+.btn.barbtn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 7px;
   line-height: 1; white-space: nowrap; overflow: hidden;
 }
 /* Fixed icon slot so the "Withdraw" and "Accept Payment" icons render at the
    same visual size and sit flush with the label's cap-height, instead of the
    raw SVG's own (uneven) intrinsic box nudging them off-centre. */
-.barbtn > svg {
-  flex: 0 0 auto; display: block; width: 16px; height: 16px;
+.btn.barbtn > svg {
+  flex: 0 0 auto; display: block; width: 17px; height: 17px;
 }
 /* Icon and label must always sit on ONE line, at any viewport width — a
    longer/translated label wrapping onto a second line pushes the icon above
-   the text, which is what made these buttons look misaligned. */
-.barbtn span { overflow: hidden; text-overflow: ellipsis; }
-.barbtn:first-child { flex: 0 0 42%; }   /* Withdraw — secondary, narrower */
-.barbtn:last-child  { flex: 1; }          /* Accept — primary, wider */
+   the text, which is what made these buttons look misaligned.
+   `flex: 0 1 auto` lets the label shrink (with ellipsis) if truly out of room,
+   but by default it hugs its text so the icon+label pair centres as one unit
+   inside the button (justify-content: center on the parent), rather than the
+   span stretching to fill and left-anchoring the text. */
+.btn.barbtn > span { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; text-align: center; }
+.btn.barbtn:first-child { flex: 0 0 42%; }   /* Withdraw — secondary, narrower */
+.btn.barbtn:last-child  { flex: 1; }          /* Accept — primary, wider */
 
 /* ── Hero balance (legacy, kept for other pages) ─────── */
 .hero {
@@ -1697,8 +1706,8 @@ h1 { font-size: 22px; }
 }
 @media (max-width: 360px) {
   .bottombar .btn { font-size: 12.5px; padding: 13px 6px; }
-  .barbtn { gap: 5px; }
-  .barbtn > svg { width: 15px; height: 15px; }
+  .btn.barbtn { gap: 5px; }
+  .btn.barbtn > svg { width: 15px; height: 15px; }
 }
 /* wallet receive/send panes */
 .wallet-pane { padding: 6px 0 4px; }

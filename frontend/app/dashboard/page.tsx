@@ -363,10 +363,10 @@ export default function Dashboard() {
       {/* bottom action bar — both primary actions */}
       <div className="bottombar">
         <Link href="/withdraw" className="btn ghost barbtn">
-          <Icon.Up /> {t("nav.withdraw")}
+          <Icon.Up /><span>{t("nav.withdraw")}</span>
         </Link>
         <button className="btn barbtn" onClick={acceptPayment}>
-          <Icon.Plus /> {t("common.acceptPayment")}
+          <Icon.Plus /><span>{t("common.acceptPayment")}</span>
         </button>
       </div>
 

@@ -123,10 +123,19 @@ export default function PosQr() {
   function resumeSession() {
     if (!pendingSession) return;
     setPayError(""); setDone(null);
+    // Restore the SAME currency the session was originally sized in — `country`
+    // may have since reverted to the merchant's registered/home currency (e.g.
+    // on a remount), and mounting the widget against the wrong currency prices
+    // this session's usdcAmount using a different currency's on-chain rate.
+    const sessionCountry =
+      (pendingSession.countryId != null ? getCountry(pendingSession.countryId) : null) ||
+      COUNTRIES.find((c) => c.code === pendingSession.currency) ||
+      country;
+    setCountry(sessionCountry);
     setLiveWidget({
       usdcAmount: BigInt(pendingSession.usdcAmount),
       quantity: BigInt(pendingSession.quantity),
-      fiat: pendingSession.fiat, usdc: pendingSession.usdc,
+      fiat: pendingSession.fiat, usdc: pendingSession.usdc, country: sessionCountry,
     });
   }
 
@@ -234,6 +243,16 @@ export default function PosQr() {
       );
     }
 
+    // Snapshot the charge currency NOW. `country` is live React state — the
+    // merchant can still tap the currency picker (or the page can remount and
+    // reset it to the registered/home country) while the on-chain price read
+    // below is in flight. Everything downstream (the priced usdcAmount, the
+    // <CheckoutWidget currencies=…> prop, the saved session) must all agree on
+    // THIS currency, not whatever `country` happens to be by the time each of
+    // them runs — otherwise the widget prices an amount sized for one currency
+    // using another currency's on-chain buyPrice, producing a wildly wrong total.
+    const chargeCountry = country;
+
     setBusy(true);
     let usdcTarget: bigint;
     if (inputMode === "usdc") {
@@ -251,7 +270,7 @@ export default function PosQr() {
       // merchant absorbs the USDC↔fiat spread — exactly the intended behavior.
       // Falls back to the estimate-rate math if the Diamond can't be priced.
       try {
-        const cfg = await fetchPriceConfig(country.code);
+        const cfg = await fetchPriceConfig(chargeCountry.code);
         usdcTarget = cfg ? usdcForFiat(amtNum, cfg) : BigInt(Math.round(usdcEquiv * 1e6));
       } catch {
         usdcTarget = BigInt(Math.round(usdcEquiv * 1e6));
@@ -274,11 +293,11 @@ export default function PosQr() {
     const usdc = Number(usdcAmount) / 1e6;
     const fiatCharged = inputMode === "usdc" ? usdc * rate.rate : amtNum;
     setLastAmt(amt);
-    setLiveWidget({ usdcAmount, quantity, fiat: fiatCharged, usdc });
+    setLiveWidget({ usdcAmount, quantity, fiat: fiatCharged, usdc, country: chargeCountry });
     // Persist so the session survives a closed dialog / refresh and can be resumed.
     saveSession({
       usdcAmount: usdcAmount.toString(), quantity: quantity.toString(),
-      fiat: fiatCharged, usdc, currency: country.code,
+      fiat: fiatCharged, usdc, currency: chargeCountry.code, countryId: chargeCountry.id,
     });
   }
 
@@ -287,10 +306,14 @@ export default function PosQr() {
   function resumePending() {
     if (!pending) return;
     setError("");
+    // Same rationale as resumeSession(): restore the currency this order was
+    // actually placed in, not whatever `country` currently is.
+    const pendingCountry = getCountry(pending.countryId) || country;
+    setCountry(pendingCountry);
     setLiveWidget({
       resumeOrderId: pending.orderId,
       usdcAmount: BigInt(Math.round(pending.usdc * 1e6)),
-      quantity: 0n, fiat: pending.fiat, usdc: pending.usdc,
+      quantity: 0n, fiat: pending.fiat, usdc: pending.usdc, country: pendingCountry,
     });
   }
 
@@ -306,7 +329,7 @@ export default function PosQr() {
     if (typeof window === "undefined" || !done || !done.token) return "";
     const q = new URLSearchParams({
       shop: shopLabel || "My Shop",
-      fiat: fmtFiat(country, done.fiat),
+      fiat: fmtFiat(done.country || country, done.fiat),
       token: done.token,
     });
     return `${window.location.origin}/receipt/${done.orderId}?${q.toString()}`;
@@ -360,20 +383,20 @@ export default function PosQr() {
               quantity={liveWidget.quantity}
               productName={shopLabel || "PayQR sale"}
               currencies={[{
-                symbol: country.code, flag: country.flag,
-                paymentMethod: country.fiat, symbolNative: country.symbol,
+                symbol: liveWidget.country.code, flag: liveWidget.country.flag,
+                paymentMethod: liveWidget.country.fiat, symbolNative: liveWidget.country.symbol,
               }]}
               onPlaced={(orderId) => {
                 savePendingOrder({
                   orderId: String(orderId), fiat: liveWidget.fiat, usdc: liveWidget.usdc,
-                  countryId: country.id, shopLabel, savedAt: Date.now(),
+                  countryId: liveWidget.country.id, shopLabel, savedAt: Date.now(),
                 });
               }}
               onComplete={(orderId) => {
                 paymentFeedback();
                 clearPendingOrder(); setPending(null);
                 const id = String(orderId);
-                setDone({ orderId: id, usdc: liveWidget.usdc, fiat: liveWidget.fiat, token: "" });
+                setDone({ orderId: id, usdc: liveWidget.usdc, fiat: liveWidget.fiat, token: "", country: liveWidget.country });
                 setLiveWidget(null); setAmt(""); clearSession(); refetchDaily();
                 // The receipt link's access token needs this order's real tx hash.
                 // The subgraph indexes it moments after settlement, so poll briefly
@@ -458,7 +481,7 @@ export default function PosQr() {
               <div className="tick-wrap"><Icon.Check /></div>
               <div className="recv-h">{t("qr.received")}<br />${done.usdc.toFixed(2)} USDC</div>
               <p className="muted recv-sub">
-                Settled on-chain · paid by customer ({fmtFiat(country, done.fiat)}).
+                Settled on-chain · paid by customer ({fmtFiat(done.country || country, done.fiat)}).
                 Withdraw to your bank or keep as USDC.
               </p>
               <div className="proofcard">
@@ -501,9 +524,13 @@ export default function PosQr() {
                 settle (live circles). Lets a merchant accept in any supported
                 currency, e.g. when travelling. Default = registered country. */}
             <div className="cur-pick-row">
+              {/* Locked while a sale is being priced (`busy`): the on-chain price
+                  read is keyed off `country.code` at the moment it started, so
+                  switching currency mid-flight would size the USDC amount for
+                  one currency while pricing it against another's rate. */}
               {payOpts.length > 1 && (
                 <div className="cur-pick">
-                  <button className={`cur-pick-btn ${pickOpen ? "on" : ""}`}
+                  <button className={`cur-pick-btn ${pickOpen ? "on" : ""}`} disabled={busy}
                     onClick={() => setPickOpen((o) => !o)}>
                     <span className="cur-pick-label">{t("qr.chargeIn")}</span>
                     <img className="cur-flag" src={`https://flagcdn.com/w40/${({india:"in",brazil:"br",argentina:"ar"})[country.id] || "un"}.png`} alt="" />
@@ -526,11 +553,11 @@ export default function PosQr() {
               {/* fiat / USDC input-mode toggle — switches what the keypad + quick
                   chips are denominated in. */}
               <div className="mode-toggle">
-                <button className={`mode-toggle-opt ${inputMode === "fiat" ? "sel" : ""}`}
+                <button className={`mode-toggle-opt ${inputMode === "fiat" ? "sel" : ""}`} disabled={busy}
                   onClick={() => { setInputMode("fiat"); setAmt(""); setError(""); }}>
                   {country.code}
                 </button>
-                <button className={`mode-toggle-opt ${inputMode === "usdc" ? "sel" : ""}`}
+                <button className={`mode-toggle-opt ${inputMode === "usdc" ? "sel" : ""}`} disabled={busy}
                   onClick={() => { setInputMode("usdc"); setAmt(""); setError(""); }}>
                   USDC
                 </button>

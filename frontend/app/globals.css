@@ -1868,10 +1868,16 @@ h1 { font-size: 22px; }
   display: flex; flex-direction: column; overflow-y: auto;
   -webkit-overflow-scrolling: touch;
 }
+/* This IS the p2p widget's inline root — a card the widget renders with an
+   inline `overflow: hidden` (see checkout.js:
+   `jsx("div", { style: { ...S.card, overflow: "hidden" } })`). That inline
+   style clips its own content, so tall checkout states (fee breakdown
+   expanded, error screens, short viewports) get cut off with no way to
+   scroll. `!important` is required to beat the widget's inline style. */
 .checkout-fullscreen > div:last-child {
   flex: 1; width: 100%; max-width: none; height: 100%; min-height: 0;
   border-radius: 0; display: flex; flex-direction: column;
-  overflow-y: auto; -webkit-overflow-scrolling: touch;
+  overflow-y: auto !important; -webkit-overflow-scrolling: touch;
 }
 .checkout-fullscreen-close {
   position: absolute; top: 16px; right: 16px; z-index: 1;

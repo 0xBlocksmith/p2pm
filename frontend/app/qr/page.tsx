@@ -6,7 +6,7 @@ import { useReadContract } from "wagmi";
 import { Nav } from "../../components/Nav";
 import { useMerchant } from "../../components/useMerchant";
 import { Icon } from "../../components/Icons";
-import { CONTRACT_ADDRESS, INTEGRATOR_ABI, perTxCapUsdc, currencyFromBytes32, USDC_UNIT } from "../../lib/contract";
+import { CONTRACT_ADDRESS, INTEGRATOR_ABI, perTxCapUsdc, currencyFromBytes32, USDC_UNIT, friendlyError } from "../../lib/contract";
 import { fetchOnchainPrice, quoteFromFiat, PriceNotConfiguredError, type OnchainPrice, type Quote } from "../../lib/price";
 import { STATIC_STALE_MS, loadMerchantProfile, saveMerchantProfile } from "../../lib/cache";
 import { loadCountry, fmtFiat, COUNTRIES, getCountry } from "../../lib/countries";
@@ -484,7 +484,19 @@ export default function PosQr() {
                 // pre-flight OK and the tx landing, the widget reports a routing/
                 // "no partner" error. Instead of a dead-end screen, fall back into
                 // the connecting-wait so we re-poll and reopen once it's back.
-                const routing = /no payment partner|no circleId|no eligible|ROUTING_NO_MERCHANTS|placeOrder\.prepare/i.test(m || "");
+                //
+                // The SDK's router simulates placement (placeOrder.prepare) BEFORE
+                // our callback runs; when no LP is assignable it reverts with a
+                // custom error from the underlying Diamond that ISN'T in our ABI, so
+                // viem can't decode it and surfaces a raw hex signature like
+                // 'Encoded error signature "0xa5fa8d2b" not found on ABI'. That's the
+                // SAME transient no-partner condition — match it (bare 4-byte selector
+                // or viem's not-found-on-ABI text) so it re-polls too, and never let
+                // that raw hex reach the merchant (see the payError panel below).
+                const raw = m || "";
+                const routing =
+                  /no payment partner|no circleId|no eligible|ROUTING_NO_MERCHANTS|placeOrder\.prepare/i.test(raw) ||
+                  /not found on ABI|signature ["']?0x[0-9a-fA-F]{8}/i.test(raw);
                 if (routing) {
                   setLiveWidget(null);
                   setConnecting({
@@ -495,8 +507,18 @@ export default function PosQr() {
                   });
                   return;
                 }
+                // Any other failure: surface a friendly, decoded message — never the
+                // raw viem string (which can be an undecodable hex signature). Keep
+                // the technical detail in the console for debugging only. The fallback
+                // is the generic no-partner copy so an undecodable cause still reads
+                // as "temporary, try again" rather than a dead-end or blank panel.
+                if (raw) console.error("checkout error:", raw);
                 clearPendingOrder(); setPending(null);
-                setPayError(m); setLiveWidget(null);
+                setPayError(friendlyError(
+                  { message: raw },
+                  "No payment partner is available right now to process this sale. This is usually temporary — please try again in a moment.",
+                ));
+                setLiveWidget(null);
               }}
             />
           </>
@@ -566,15 +588,16 @@ export default function PosQr() {
           </div>
         )}
 
-        {/* Friendly message when the QR can't be created (no LP available) */}
+        {/* Friendly message when the QR can't be created. `payError` is always a
+            humanized, decoded message here (see the widget's onError) — NEVER a raw
+            viem string or hex signature — so it's safe to show directly. Falls back
+            to the generic no-partner copy when we couldn't decode a specific cause. */}
         {payError && !liveWidget && !done && (
           <div className="panel" style={{ textAlign: "center" }}>
             <h2>Couldn’t start this payment</h2>
-            <p className="muted" style={{ margin: "8px 0 4px" }}>
-              No payment partner is available right now to process this sale. This
-              is usually temporary — please try again in a moment.
+            <p className="muted" style={{ margin: "8px 0 14px" }}>
+              {payError}
             </p>
-            <p className="tiny" style={{ color: "var(--muted)", marginBottom: 14 }}>{payError}</p>
             <button className="btn" style={{ width: "100%" }}
               onClick={() => { setPayError(""); }}>
               Try again

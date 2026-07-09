@@ -31,6 +31,9 @@ export default function Onboarding() {
   const [shopName, setShopName] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  // TEMP diagnostic: the raw on-chain/AA reason, shown on-screen so it can be
+  // captured without a device console. Remove once registration is confirmed.
+  const [debugRaw, setDebugRaw] = useState("");
 
   // Keep the latest sendTransaction in a ref so the submit poll loop sees the
   // smart wallet becoming ready (the value changes after first render).
@@ -64,6 +67,7 @@ export default function Onboarding() {
   async function submit(e) {
     e.preventDefault();
     setError("");
+    setDebugRaw("");
     if (!shopName.trim()) return setError("Enter your shop name.");
     if (!country.validatePayout(payoutId.trim())) {
       return setError(`Enter a valid ${country.payoutLabel} (like ${country.payoutPlaceholder}).`);
@@ -135,6 +139,17 @@ export default function Onboarding() {
         err?.shortMessage || err?.details || err?.reason ||
         err?.cause?.shortMessage || err?.cause?.message || err?.message || ""
       );
+      // TEMP: surface the deepest detail on-screen for diagnosis (data field,
+      // cause chain, metaMessages) — not just the flattened one-liner.
+      try {
+        const parts = [
+          err?.name, err?.shortMessage, err?.details, err?.reason,
+          err?.data, err?.cause?.shortMessage, err?.cause?.message, err?.cause?.data,
+          Array.isArray(err?.metaMessages) ? err.metaMessages.join(" | ") : "",
+          err?.message,
+        ].filter(Boolean);
+        setDebugRaw([...new Set(parts.map(String))].join("\n").slice(0, 800));
+      } catch { setDebugRaw(String(err?.message || err || "")); }
       // The revert might be AlreadyRegistered — meaning a prior attempt DID land.
       // The AA/RPC path often strips the custom-error data, so this surfaces as an
       // opaque "Execution Reverted: {}". Re-check the live flag: if we're actually
@@ -207,6 +222,15 @@ export default function Onboarding() {
             </p>
           )}
           {error && <p className="error">{error}</p>}
+          {debugRaw && (
+            <pre style={{
+              fontSize: 10.5, lineHeight: 1.35, whiteSpace: "pre-wrap", wordBreak: "break-word",
+              background: "rgba(0,0,0,0.05)", color: "#b00", padding: "8px 10px",
+              borderRadius: 8, marginTop: 8, maxHeight: 180, overflow: "auto",
+            }}>
+              {debugRaw}
+            </pre>
+          )}
           <button
             type="button"
             className="onb-back"

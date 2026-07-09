@@ -60,7 +60,9 @@ async function readMerchant(
 ): Promise<{ registered: boolean; shopName: string } | null> {
   try {
     // getMerchantInfo(address) returns
-    //   (string payoutId, string shopName, bytes32 currency, bool isRegistered, bool isFrozen)
+    //   (bytes encPayoutId, string shopName, bytes32 currency, bool isRegistered, bool isFrozen)
+    // NOTE: index 0 is the ENCRYPTED payout blob (never plaintext); we only read
+    // shopName (index 1) and isRegistered (index 3) here.
     const info: any = await reader.readContract({
       address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI,
       functionName: "getMerchantInfo", args: [addr as `0x${string}`],

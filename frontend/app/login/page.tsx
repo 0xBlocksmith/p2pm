@@ -46,22 +46,29 @@ export default function Login() {
     if (ready && !authenticated) setShowTour(true);
   }, [ready, authenticated]);
 
-  async function onLogin() {
-    // persist the picks so the rest of the app is country-aware immediately
+  function persistPrefs() {
+    // Persist the picks so the rest of the app is country-aware. Called ONLY on a
+    // successful/authenticated path — NOT before login() — so a cancelled connect
+    // never leaves one visitor's currency + prefsSet behind for the next person on
+    // a shared device (clearLocalUserData wiped them on the previous logout).
     saveCountry(country.id);
     markPrefsSet();
+  }
+  async function onLogin() {
     // Already signed in (e.g. returned here only to pick prefs)? Don't reopen
     // the connect modal — just proceed; "/" now routes to the dashboard since
     // prefs are set. Otherwise open the thirdweb connect modal (email/social).
-    if (authenticated) { router.replace("/"); return; }
+    if (authenticated) { persistPrefs(); router.replace("/"); return; }
     try {
       await login();
+      // Only NOW that auth succeeded do we persist prefs + flag the tour.
+      persistPrefs();
       // Flag the how-it-works tour for a first-time device (AppTour's own
       // localStorage gate means a returning user won't re-see it).
       flagNewUser();
       router.replace("/");
     } catch {
-      // User closed the modal / cancelled — stay on the login page.
+      // User closed the modal / cancelled — stay on the login page, persist nothing.
     }
   }
 

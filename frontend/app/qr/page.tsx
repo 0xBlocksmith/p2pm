@@ -7,11 +7,10 @@ import { Nav } from "../../components/Nav";
 import { useMerchant } from "../../components/useMerchant";
 import { Icon } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, perTxCapUsdc, currencyFromBytes32 } from "../../lib/contract";
-import { fetchUsdcRate } from "../../lib/rates";
-import { fetchPriceConfig, usdcForFiat } from "../../lib/pricing";
+import { fetchOnchainPrice, quoteFromFiat, PriceNotConfiguredError, type OnchainPrice, type Quote } from "../../lib/price";
 import { STATIC_STALE_MS, loadMerchantProfile, saveMerchantProfile } from "../../lib/cache";
 import { loadCountry, fmtFiat, COUNTRIES, getCountry } from "../../lib/countries";
-import { loadPendingOrder, savePendingOrder, clearPendingOrder } from "../../lib/p2p";
+import { loadPendingOrder, savePendingOrder, clearPendingOrder, isPaymentPartnerAvailable } from "../../lib/p2p";
 import { fetchOrder, receiptToken } from "../../lib/history";
 import type { PendingOrder } from "../../lib/p2p";
 import { useT } from "../../lib/i18n";
@@ -30,19 +29,15 @@ const QUICK = { INR: [10, 20, 50], BRL: [5, 10, 20], ARS: [500, 1000, 2000] };
 // Quick-amount presets when charging directly in USDC.
 const QUICK_USDC = [1, 5, 10];
 
-// Format the RAW typed amount for display: group the integer part with the
-// country's locale but keep the decimal part EXACTLY as typed (so "10.", "10.1",
-// "10.10" all render faithfully while the merchant is entering them). Passing the
-// string through a number formatter would round/strip the in-progress decimal.
+// Format the RAW typed amount for display: group the integer part with a comma
+// and keep the decimal part EXACTLY as typed (so "10.", "10.1", "10.10" all
+// render faithfully while the merchant is entering them). Passing the string
+// through a number formatter would round/strip the in-progress decimal, and a
+// locale formatter would turn "1000" into "1.000" for pt-BR / es-AR (which use
+// "." as their thousands separator) — ambiguous against the keypad's decimal ".".
 function fmtTyped(raw: string, _country?: any): string {
   if (!raw) return "0";
   const [intPart, decPart] = raw.split(".");
-  // Group the integer part with a COMMA and keep "." as the decimal separator —
-  // ALWAYS, regardless of locale. The keypad's decimal key inserts a ".", but
-  // pt-BR / es-AR use "." as their THOUSANDS separator, so a locale formatter
-  // turns "1000" into "1.000" (reads as a decimal) and "1000.50" into the
-  // ambiguous "1.000.50". A fixed comma-group / dot-decimal keeps the amount
-  // unmistakable and consistent with what the merchant typed.
   const grouped = (intPart || "0").replace(/^0+(?=\d)/, "").replace(/\B(?=(\d{3})+(?!\d))/g, ",");
   return decPart !== undefined ? `${grouped}.${decPart}` : grouped;
 }
@@ -79,20 +74,28 @@ export default function PosQr() {
   const [amt, setAmt] = useState("");        // local fiat the merchant types
   const [lastAmt, setLastAmt] = useState(""); // for "repeat"
   const [inputMode, setInputMode] = useState<"fiat" | "usdc">("fiat"); // what `amt` is denominated in
-  const [rate, setRate] = useState(null);           // p2p rate (on-chain price via rates.ts); used until priceCfg loads
-  const [priceCfg, setPriceCfg] = useState(null);   // live on-chain price for `country` — the REAL charge price
+  // ON-CHAIN price = the SINGLE source of truth. `price` holds the Diamond's live
+  // getPriceConfig().buyPrice (+ small-order fee) — the EXACT rate the checkout
+  // widget settles against, so the Accept figure and the Order Summary agree.
+  const [price, setPrice] = useState<OnchainPrice | null>(null);
+  const [priceErr, setPriceErr] = useState("");
   const [error, setError] = useState("");
   const [liveWidget, setLiveWidget] = useState(null);
   const [done, setDone] = useState(null);
   const [payError, setPayError] = useState("");
-  const [busy, setBusy] = useState(false); // pricing the sale (reading on-chain buyPrice)
+  const [busy, setBusy] = useState(false); // pricing the sale
   const [imgBusy, setImgBusy] = useState(false);
   const captureRef = useRef<HTMLDivElement>(null);
+  // Pre-flight: when the merchant taps Accept we first confirm an LP is
+  // assignable for this currency+amount (the exact on-chain check the widget's
+  // router runs) BEFORE opening checkout — so placement never fails with "no
+  // payment partner". `connecting` holds the pending order while we poll; the
+  // widget only mounts once a partner is found.
+  const [connecting, setConnecting] = useState<any>(null);
   // A payment session that was started but not finished (widget closed / left)
   // BEFORE the order landed on-chain. Persisted so the merchant can RESUME it
   // instead of losing the sale, and can CANCEL a stuck one. Cleared on
-  // complete/cancel. (Bug: closing the p2p dialog used to orphan the session
-  // forever.)
+  // complete/cancel.
   const [pendingSession, setPendingSession] = useState(null);
   const SESSION_KEY = "payqr.pendingSession";
   const SESSION_TTL_MS = 15 * 60 * 1000; // 15 min — a stale session auto-expires
@@ -193,61 +196,65 @@ export default function PosQr() {
     query: { enabled: !!registeredCurrencyB32 },
   });
 
+  // LIVE on-chain buy price for the sale currency — the value the widget's Order
+  // Summary uses. Refetched on currency change and every 60s so the terminal
+  // stays in step with any admin re-price. On failure we surface priceErr and
+  // show a retry state; order creation is blocked until a real on-chain price
+  // loads (see generate()) — we never place an order off a guessed rate.
   useEffect(() => {
-    if (!country) return;
+    if (!country?.code) { setPrice(null); return; }
     let alive = true;
-    const load = () => fetchUsdcRate(country).then((r) => alive && setRate(r));
+    setPrice(null); // clear stale price while the new currency's loads
+    const load = () =>
+      fetchOnchainPrice(country.code)
+        .then((p) => { if (alive) { setPrice(p); setPriceErr(""); } })
+        .catch((e) => {
+          if (!alive) return;
+          setPrice(null);
+          // Distinguish "protocol hasn't priced this currency yet" (permanent,
+          // no point retrying) from a transient read failure (keep retrying).
+          setPriceErr(
+            e instanceof PriceNotConfiguredError
+              ? `${country.name || country.code} isn't available for payments yet.`
+              : "Couldn't load the live price. Retrying…"
+          );
+        });
     load();
     const t = setInterval(load, 60_000);
     return () => { alive = false; clearInterval(t); };
-  }, [country]);
-
-  // Load the LIVE on-chain price for the selected currency — this is the rate
-  // the checkout ACTUALLY charges at (getPriceConfig buyPrice + small-order fee).
-  // rates.ts now sources the SAME on-chain price, so the estimate and this only
-  // differ before it loads. We show the estimate off THIS so the "≈ X USDC" the
-  // merchant sees before pressing Accept matches the checkout total exactly.
-  useEffect(() => {
-    if (!country) { setPriceCfg(null); return; }
-    let alive = true;
-    setPriceCfg(null); // clear stale price while the new currency's loads
-    fetchPriceConfig(country.code)
-      .then((cfg) => { if (alive) setPriceCfg(cfg ? { code: country.code, ...cfg } : { code: country.code, missing: true }); })
-      .catch(() => { if (alive) setPriceCfg({ code: country.code, missing: true }); });
-    return () => { alive = false; };
-  }, [country]);
-
-  // The on-chain buyPrice as a plain number of fiat-per-USDC, when it's for the
-  // CURRENT currency and usable. This is what both the estimate and generate()
-  // price against, so they always agree.
-  const onchainRate =
-    priceCfg && !priceCfg.missing && priceCfg.code === country?.code && priceCfg.buyPrice > 0n
-      ? Number(priceCfg.buyPrice) / 1e6
-      : null;
-  // Effective fiat-per-USDC for the pre-submit estimate: prefer the freshly-read
-  // on-chain price (what checkout charges); fall back to `rate` (also the p2p
-  // on-chain price, via rates.ts) only until this dedicated read loads.
-  const estRate = onchainRate ?? (rate ? rate.rate : null);
+  }, [country?.code, country?.name]);
 
   const amtNum = Number(amt) || 0;
-  // In USDC mode the typed number IS the USDC amount. In fiat mode the estimate
-  // must match what generate()/checkout will actually charge:
-  //  • With the on-chain price loaded, run the SAME usdcForFiat() inversion the
-  //    order is sized with (it accounts for the small-order fixed fee), so the
-  //    "≈ X USDC" equals the checkout amount to the cent.
-  //  • Before that loads / for an unpriced currency, fall back to a plain
-  //    market-rate division.
-  const usdcEquiv =
-    inputMode === "usdc"
-      ? amtNum
-      : amtNum > 0
-        ? onchainRate && priceCfg && !priceCfg.missing
-          ? Number(usdcForFiat(amtNum, priceCfg)) / 1e6
-          : estRate
-            ? amtNum / estRate
-            : 0
-        : 0;
-  const fiatEquiv = inputMode === "usdc" ? (estRate && amtNum > 0 ? amtNum * estRate : 0) : amtNum;
+  // The on-chain buyPrice as fiat-per-USDC, for the current currency, when usable.
+  const estRate = price ? price.rate : null;
+
+  // Build the on-chain quote. In FIAT mode we invert the widget's formula through
+  // the Diamond's buyPrice (quoteFromFiat sizes the order so the CUSTOMER pays the
+  // entered amount and the fee comes OUT of it). In USDC mode the typed number IS
+  // the order's USDC amount — the customer pays its fiat equivalent.
+  let quote: Quote | null = null;
+  if (price && amtNum > 0) {
+    if (inputMode === "usdc") {
+      const usdcAmount = BigInt(Math.round(amtNum * 1e6));
+      const quantity = (usdcAmount + 5_000n) / 10_000n;
+      const snapped = quantity * 10_000n;
+      const feeUsdc =
+        price.smallOrderThreshold > 0n && snapped > 0n && snapped <= price.smallOrderThreshold
+          ? price.smallOrderFixedFee : 0n;
+      const creditedUsdc = snapped > feeUsdc ? snapped - feeUsdc : 0n;
+      const subtotalFiat = (snapped * price.buyPrice) / 1_000_000n;
+      const feeFiat = (feeUsdc * price.buyPrice) / 1_000_000n;
+      quote = {
+        usdcAmount: snapped, quantity, feeUsdc, creditedUsdc,
+        subtotalFiat, totalFiat: subtotalFiat + feeFiat,
+        usdc: Number(snapped) / 1e6, credited: Number(creditedUsdc) / 1e6,
+        fee: Number(feeUsdc) / 1e6, total: Number(subtotalFiat + feeFiat) / 1e6,
+      };
+    } else {
+      quote = quoteFromFiat(amtNum, price);
+    }
+  }
+
   // Per-tx cap keys off the merchant's REGISTERED currency (what the contract
   // enforces in validateOrder), NOT the currency picked in the terminal — else
   // an INR merchant (50 cap) charging in BRL would be shown a 100 cap and the
@@ -259,7 +266,9 @@ export default function PosQr() {
     liveCapRaw != null
       ? Number(liveCapRaw) / 1e6
       : perTxCapUsdc(registeredCode || country?.code || "INR");
-  const overCap = usdcEquiv > capUsdc;
+  // The on-chain per-tx cap is enforced against the ORDER amount (usdcAmount),
+  // not the fee-adjusted credit — mirror that so the warning matches the revert.
+  const overCap = quote ? quote.usdc > capUsdc : false;
 
   function press(k) {
     setError("");
@@ -277,65 +286,79 @@ export default function PosQr() {
     });
   }
 
-  async function generate() {
+  function generate() {
     setError("");
-    if (!estRate) return;
+    // Order creation REQUIRES the live on-chain price — never place an order off
+    // an indicative rate, or the customer's Order Summary would disagree with
+    // what the merchant just accepted.
+    if (!price || !quote) {
+      return setError(priceErr || "Live price is still loading — one moment.");
+    }
     if (amtNum <= 0) return setError(inputMode === "usdc" ? "Enter the amount in USDC." : `Enter the amount in ${country.code}.`);
     if (overCap) {
       return setError(
-        `Max ${capUsdc} USDC per sale (≈ ${fmtFiat(country, capUsdc * estRate)} now).`
+        `Max ${capUsdc} USDC per sale (≈ ${fmtFiat(country, capUsdc * price.rate)} now).`
       );
     }
 
-    // Snapshot the charge currency NOW so everything downstream (the priced
-    // usdcAmount, the <CheckoutWidget currencies=…> prop, the saved session)
-    // agrees on THIS currency even if `country` changes before they run.
+    // Snapshot the charge currency NOW so everything downstream agrees on THIS
+    // currency even if `country` changes before they run.
     const chargeCountry = country;
-
-    setBusy(true);
-    let usdcTarget: bigint;
-    if (inputMode === "usdc") {
-      // The merchant typed the USDC amount directly — charge exactly that, no
-      // fiat-quote inversion needed.
-      usdcTarget = BigInt(Math.round(amtNum * 1e6));
-      setBusy(false);
-    } else {
-      // SIZE THE USDC SO THE CUSTOMER PAYS EXACTLY WHAT THE MERCHANT QUOTED,
-      // against the SAME on-chain buyPrice both the estimate above (estRate) and
-      // the checkout widget use. Re-read fresh here (the cached `priceCfg` is for
-      // display; this guarantees the order is sized against the latest on-chain
-      // value at submit time). Falls back to the estimate math if unpriceable.
-      try {
-        const cfg = await fetchPriceConfig(chargeCountry.code);
-        usdcTarget = cfg ? usdcForFiat(amtNum, cfg) : BigInt(Math.round(usdcEquiv * 1e6));
-      } catch {
-        usdcTarget = BigInt(Math.round(usdcEquiv * 1e6));
-      } finally {
-        setBusy(false);
-      }
-    }
-
-    // Our integrator prices in whole USDC cents (product-2 units = 0.01 USDC),
-    // so quantity must be an integer number of cents and usdcAmount is derived
-    // from it (× 10_000 6-dec units) — keeping the widget's displayed amount
-    // exactly equal to the on-chain order total (quantity × unit price).
-    // usdcForFiat() already snaps to the cent that lands closest to the quoted
-    // fiat total (picking whichever neighbour minimizes the drift, not just
-    // rounding the pre-fee amount) — this is a no-op for that path, and a
-    // safety-net round for the USDC-direct-entry / no-price-config fallbacks.
-    const quantity = (usdcTarget + 5_000n) / 10_000n; // round to nearest cent
+    const { usdcAmount, quantity } = quote;
     if (quantity === 0n) return setError("Amount too small.");
-    const usdcAmount = quantity * 10_000n;
-    const usdc = Number(usdcAmount) / 1e6;
-    const fiatCharged = inputMode === "usdc" ? usdc * (estRate ?? 0) : amtNum;
     setLastAmt(amt);
-    setLiveWidget({ usdcAmount, quantity, fiat: fiatCharged, usdc, country: chargeCountry });
-    // Persist so the session survives a closed dialog / refresh and can be resumed.
-    saveSession({
-      usdcAmount: usdcAmount.toString(), quantity: quantity.toString(),
-      fiat: fiatCharged, usdc, currency: chargeCountry.code, countryId: chargeCountry.id,
+
+    // The customer's fiat is the entered amount (fiat mode) or the quote's
+    // fiat-equivalent total (USDC mode). `usdc` = what the merchant KEEPS
+    // (credited, i.e. after the fee) so the receipt/resume shows the right figure.
+    const fiatCharged = inputMode === "usdc" ? quote.total : amtNum;
+    const keptUsdc = quote.credited;
+
+    // Enter the PRE-FLIGHT phase instead of opening checkout directly: the effect
+    // below confirms an LP is assignable (the same on-chain check the widget's
+    // router runs) and only THEN mounts the widget — so placement can't fail with
+    // "no payment partner". We carry the fiat's 6-dec value for the partner check.
+    setPayError("");
+    setConnecting({
+      usdcAmount, quantity, fiat: fiatCharged, usdc: keptUsdc,
+      fiat6: BigInt(Math.round(fiatCharged * 1e6)), code: chargeCountry.code,
+      country: chargeCountry,
     });
   }
+
+  // Pre-flight poller: while `connecting`, repeatedly ask the chain whether a
+  // payment partner (LP) is assignable for this currency+amount+buyer. The moment
+  // one is, we promote to the live widget (and persist a resumable session). If
+  // none appears, we stay in the calm "connecting" state — no error screen, no
+  // blind retries, and the merchant can cancel.
+  useEffect(() => {
+    if (!connecting || !address) return;
+    let alive = true;
+    const open = () => {
+      setLiveWidget({
+        usdcAmount: connecting.usdcAmount, quantity: connecting.quantity,
+        fiat: connecting.fiat, usdc: connecting.usdc, country: connecting.country,
+      });
+      saveSession({
+        usdcAmount: connecting.usdcAmount.toString(),
+        quantity: connecting.quantity.toString(),
+        fiat: connecting.fiat, usdc: connecting.usdc,
+        currency: connecting.code, countryId: connecting.country?.id,
+      });
+      setConnecting(null);
+    };
+    const check = async () => {
+      const ok = await isPaymentPartnerAvailable(
+        connecting.code, address, connecting.usdcAmount, connecting.fiat6,
+      );
+      if (!alive) return;
+      if (ok) { open(); return; }
+      // Not yet — poll again shortly. Kept snappy (1.5s) since the gap is brief.
+      timer = setTimeout(check, 1500);
+    };
+    let timer: any = setTimeout(check, 0);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [connecting, address]);
 
   // Reopen the checkout modal against a previously-placed order (the merchant
   // closed the dialog before it finished) instead of starting a fresh sale.
@@ -452,8 +475,25 @@ export default function PosQr() {
                 clearPendingOrder(); setPending(null);
                 setLiveWidget(null); clearSession(); refetchDaily();
               }}
+              // Closing the dialog does NOT discard the session — it stays so the
+              // merchant can resume it from the "pending payment" banner below.
               onClose={() => setLiveWidget(null)}
               onError={(m) => {
+                // Safety net: if the LP dropped in the split second between our
+                // pre-flight OK and the tx landing, the widget reports a routing/
+                // "no partner" error. Instead of a dead-end screen, fall back into
+                // the connecting-wait so we re-poll and reopen once it's back.
+                const routing = /no payment partner|no circleId|no eligible|ROUTING_NO_MERCHANTS|placeOrder\.prepare/i.test(m || "");
+                if (routing) {
+                  setLiveWidget(null);
+                  setConnecting({
+                    usdcAmount: liveWidget.usdcAmount, quantity: liveWidget.quantity,
+                    fiat: liveWidget.fiat, usdc: liveWidget.usdc,
+                    fiat6: BigInt(Math.round(liveWidget.fiat * 1e6)),
+                    code: liveWidget.country.code, country: liveWidget.country,
+                  });
+                  return;
+                }
                 clearPendingOrder(); setPending(null);
                 setPayError(m); setLiveWidget(null);
               }}
@@ -461,10 +501,30 @@ export default function PosQr() {
           </>
         )}
 
+        {/* Pre-flight: confirming a payment partner (LP) is online before we open
+            checkout. On testnet the single LP flickers; rather than open the
+            widget and let placement fail, we hold here and poll until a partner
+            is assignable, then the effect promotes us to the live widget. The
+            merchant can cancel to go back to the keypad. */}
+        {connecting && !liveWidget && !done && (
+          <div className="panel" style={{ textAlign: "center" }}>
+            <h2>Connecting to a payment partner…</h2>
+            <p className="muted" style={{ margin: "8px 0 4px" }}>
+              Getting {fmtFiat(connecting.country || country, connecting.fiat)} ready — this usually takes a moment.
+              Keep this screen open; the QR appears automatically.
+            </p>
+            <div className="spinner" style={{ margin: "14px auto" }} aria-hidden="true" />
+            <button className="btn ghost" style={{ width: "100%" }}
+              onClick={() => setConnecting(null)}>
+              Cancel
+            </button>
+          </div>
+        )}
+
         {/* Resume / cancel an unfinished payment that hasn't reached the chain
             yet (dialog was closed or app left before the order was placed).
             Fixes the orphaned-session bug + gives a way out of a stuck order. */}
-        {pendingSession && !pending && !liveWidget && !done && (
+        {pendingSession && !pending && !liveWidget && !done && !connecting && (
           <div className="panel" style={{ textAlign: "center" }}>
             <h2>Payment in progress</h2>
             <p className="muted" style={{ margin: "6px 0 12px" }}>
@@ -491,7 +551,7 @@ export default function PosQr() {
 
         {/* A payment was placed on-chain but the dialog closed before it
             finished — offer to pick it back up instead of losing it. */}
-        {pending && !liveWidget && !done && !payError && (
+        {pending && !liveWidget && !done && !payError && !connecting && (
           <div className="panel" style={{ textAlign: "center" }}>
             <h2>Unfinished payment</h2>
             <p className="muted" style={{ margin: "8px 0 4px" }}>
@@ -557,7 +617,7 @@ export default function PosQr() {
           </div>
         )}
 
-        {limitReached && !liveWidget && !done && !payError && !pendingSession && !pending && (
+        {limitReached && !liveWidget && !done && !payError && !pendingSession && !pending && !connecting && (
           <div className="panel">
             <h2>Daily limit reached ({String(used)}/{String(limit)})</h2>
             <p className="muted">All transactions used for today. Resets at midnight UTC.</p>
@@ -565,16 +625,13 @@ export default function PosQr() {
         )}
 
         {/* Number-pad terminal */}
-        {!limitReached && !liveWidget && !done && !payError && !pendingSession && !pending && (
+        {!limitReached && !liveWidget && !done && !payError && !pendingSession && !pending && !connecting && (
           <div className="terminal">
-            {/* charge-currency picker — only shows currencies the protocol can
-                settle (live circles). Lets a merchant accept in any supported
-                currency, e.g. when travelling. Default = registered country. */}
+            {/* charge-currency picker + fiat/USDC input-mode toggle */}
             <div className="cur-pick-row">
-              {/* Locked while a sale is being priced (`busy`): the on-chain price
-                  read is keyed off `country.code` at the moment it started, so
-                  switching currency mid-flight would size the USDC amount for
-                  one currency while pricing it against another's rate. */}
+              {/* charge-currency picker — lets a merchant accept in any supported
+                  currency, e.g. when travelling. Default = registered country.
+                  Locked while a sale is being priced (`busy`). */}
               {payOpts.length > 1 && (
                 <div className="cur-pick">
                   <button className={`cur-pick-btn ${pickOpen ? "on" : ""}`} disabled={busy}
@@ -619,16 +676,28 @@ export default function PosQr() {
                 {inputMode === "usdc" ? `${fmtTyped(amt, country)} USDC` : `${country.symbol}${fmtTyped(amt, country)}`}
               </div>
               <div className="t-sub">
-                {estRate
-                  ? amtNum > 0
+                {amtNum <= 0
+                  ? t("qr.enterAmount")
+                  : quote
                     ? inputMode === "usdc"
-                      ? `≈ ${fmtFiat(country, fiatEquiv)} ${country.code}`
-                      : `≈ ${usdcEquiv.toFixed(2)} USDC ${t("qr.youKeep")}`
-                    : t("qr.enterAmount")
-                  : t("qr.fetchingRate")}
+                      ? `≈ ${fmtFiat(country, quote.total)} ${country.code}`
+                      : `≈ ${quote.credited.toFixed(2)} USDC ${t("qr.youKeep")}`
+                    : priceErr
+                      ? priceErr
+                      : t("qr.fetchingRate")}
               </div>
-              {overCap && estRate && (
-                <div className="t-warn">Max {fmtFiat(country, capUsdc * estRate)} per sale</div>
+              {/* The fee is taken OUT of the entered amount: the customer pays the
+                  amount the merchant typed, and the fee is deducted from the
+                  merchant's proceeds. Spell that out so there are no surprises. */}
+              {quote && quote.fee > 0 && (
+                <div className="t-sub" style={{ opacity: 0.8, fontSize: "0.85em" }}>
+                  {inputMode === "usdc"
+                    ? `Fee ${quote.fee.toFixed(2)} USDC deducted · you keep ${quote.credited.toFixed(2)} USDC`
+                    : `Customer pays ${fmtFiat(country, quote.total)} · ${fmtFiat(country, quote.fee * price!.rate)} fee comes out of it`}
+                </div>
+              )}
+              {overCap && price && (
+                <div className="t-warn">Max {fmtFiat(country, capUsdc * price.rate)} per sale</div>
               )}
             </div>
 
@@ -655,7 +724,7 @@ export default function PosQr() {
 
             <button className="btn t-charge"
               style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
-              disabled={!ready || !estRate || amtNum <= 0 || overCap || busy} onClick={generate}>
+              disabled={!ready || !quote || amtNum <= 0 || overCap || busy} onClick={generate}>
               <Icon.Qr /> {busy ? t("qr.fetchingRate") : amtNum > 0 ? `${t("common.acceptPayment")} · ${inputMode === "usdc" ? `${fmtTyped(amt, country)} USDC` : `${country.symbol}${fmtTyped(amt, country)}`}` : t("common.acceptPayment")}
             </button>
             {error && <p className="error" style={{ textAlign: "center" }}>{error}</p>}

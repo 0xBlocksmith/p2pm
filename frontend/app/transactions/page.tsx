@@ -8,7 +8,7 @@ import { Icon } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, fmtUsdc } from "../../lib/contract";
 import { fetchHistory, fetchWithdrawals } from "../../lib/history";
 import { loadCountry, fmtFiat } from "../../lib/countries";
-import { fetchUsdcRate } from "../../lib/rates";
+import { fetchOnchainSellPrice } from "../../lib/price";
 import { useT } from "../../lib/i18n";
 
 const STATUS_STYLE = { matching: "locked", settled: "available", cancelled: "withdrawn" };
@@ -56,8 +56,8 @@ export default function Transactions() {
 
   useEffect(() => { setCountry(loadCountry()); }, []);
   useEffect(() => {
-    if (!country) return;
-    fetchUsdcRate(country).then(setRate).catch(() => {});
+    if (!country?.code) return;
+    fetchOnchainSellPrice(country.code).then(setRate).catch(() => setRate(null));
   }, [country]);
 
   const { data: balance } = useReadContract({

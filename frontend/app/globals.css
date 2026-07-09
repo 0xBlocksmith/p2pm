@@ -1020,6 +1020,7 @@ p.muted { color: var(--muted); font-size: 14px; }
 .rr-status.ok   { background: var(--success-soft); color: var(--success); }
 .rr-status.wait { background: var(--warn-soft); color: var(--warn); }
 .rr-status.bad  { background: var(--bg-soft); color: var(--muted); }
+.rr-status.out  { background: var(--accent-soft); color: var(--accent); }
 
 /* ── Login currency/language dropdowns (p2p.me-style) ──── */
 .login-sub { font-size: 15px; font-weight: 800; color: var(--text); margin: 14px 0 12px; text-align: center; }
@@ -1129,6 +1130,7 @@ h1 { font-size: 22px; }
 }
 .rr-status.ok { background: var(--mint-soft); color: var(--mint); }
 .rr-status.wait { background: var(--warn-soft); color: var(--warn); }
+.rr-status.out { background: var(--accent-soft); color: var(--accent); }
 .today-pill {
   background: var(--bg-soft); border: var(--border-w) solid var(--border);
   border-radius: 11px;

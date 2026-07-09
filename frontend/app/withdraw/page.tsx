@@ -10,7 +10,7 @@ import { useRelayIdentity } from "../../components/useRelayIdentity";
 import { Icon } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, fmtUsdc, currencyFromBytes32, friendlyError } from "../../lib/contract";
 import { encryptPayout, decryptPayout } from "../../lib/payoutCrypto";
-import { fetchUsdcRate } from "../../lib/rates";
+import { fetchOnchainSellPrice, usdcForFiatSell, PriceNotConfiguredError } from "../../lib/price";
 import { loadCountry, fmtFiat, COUNTRIES } from "../../lib/countries";
 import { buildUsdcWithdraw } from "../../lib/withdraw";
 import { fetchWithdrawals } from "../../lib/history";
@@ -47,7 +47,12 @@ export default function Withdraw() {
   const [wdCode, setWdCode] = useState("");          // the currency to withdraw IN
   const [otherOpts, setOtherOpts] = useState([]);    // all countries (+ live flag)
   const [otherOpen, setOtherOpen] = useState(false);
-  const [rate, setRate] = useState(null);
+  // ON-CHAIN SELL price for the currency being withdrawn IN (wdCode). This is the
+  // rate the offramp actually settles at, so the merchant's typed fiat payout
+  // matches what the Cashout widget delivers — same fix as the Accept page's buy
+  // price. Keyed off wdCode (the SELL currency), NOT the display country.
+  const [sellPrice, setSellPrice] = useState(null);
+  const [sellErr, setSellErr] = useState("");        // clear msg when a currency isn't priced
   const [now, setNow] = useState(Math.floor(Date.now() / 1000));
   const [cashout, setCashout] = useState(null); // active fiat cash-out (Cashout widget)
   const [payoutChoice, setPayoutChoice] = useState("saved"); // "saved" | "new"
@@ -68,12 +73,28 @@ export default function Withdraw() {
     const t = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
     return () => clearInterval(t);
   }, [cashout]);
+  // Live on-chain SELL price for the withdraw currency. Refetched when the
+  // merchant switches withdraw currency; cleared on failure so the amount field
+  // shows a "loading rate" state rather than converting off a stale/guessed rate.
   useEffect(() => {
-    if (!country) return;
+    if (!wdCode) return;
     let on = true;
-    fetchUsdcRate(country).then((r) => on && setRate(r)).catch(() => {});
-    return () => { on = false; };
-  }, [country]);
+    const load = () =>
+      fetchOnchainSellPrice(wdCode)
+        .then((p) => { if (on) { setSellPrice(p); setSellErr(""); } })
+        .catch((e) => {
+          if (!on) return;
+          setSellPrice(null);
+          setSellErr(
+            e instanceof PriceNotConfiguredError
+              ? `Withdrawals in ${wdCode} aren't available yet.`
+              : ""
+          );
+        });
+    load();
+    const t = setInterval(load, 60_000);
+    return () => { on = false; clearInterval(t); };
+  }, [wdCode]);
 
   const { data: buckets } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "getMerchantBuckets",
@@ -191,14 +212,21 @@ export default function Withdraw() {
   const registeredCode = currencyFromBytes32(info?.[2] as string);
   const [pending, available] = balance ?? [0n, 0n];
   const availNum = Number(available) / 1e6;               // available in USDC
-  const availFiat = rate ? availNum * rate.rate : null;   // available in local fiat
+  // Available balance shown in local fiat, at the ON-CHAIN sell rate the offramp
+  // settles at (not an off-chain guess) — so the "≈ ₹X available" preview matches
+  // what a full cash-out would actually deliver.
+  const availFiat = sellPrice ? availNum * sellPrice.rate : null;
 
-  // The AMOUNT FIELD is now entered in LOCAL FIAT (₹ / R$ / …) — what a shopkeeper
-  // thinks in — and we convert to USDC under the hood. Empty = withdraw MAX.
+  // The AMOUNT FIELD is entered in LOCAL FIAT (₹ / R$ / …) — what a shopkeeper
+  // thinks in — and we convert to USDC under the hood using the on-chain SELL
+  // price. Empty = withdraw MAX.
   const typedFiat = amount.trim();
-  // fiat the user wants → USDC (÷ rate). Empty means "everything".
+  // fiat the user wants → USDC via the on-chain sellPrice. Empty means "everything".
   const fiatNum = typedFiat === "" ? availFiat ?? 0 : (Number(typedFiat) || 0);
-  const usdcNum = typedFiat === "" ? availNum : (rate ? fiatNum / rate.rate : 0);
+  const usdcNum =
+    typedFiat === ""
+      ? availNum
+      : (sellPrice ? Number(usdcForFiatSell(Number(typedFiat) || 0, sellPrice)) / 1e6 : 0);
   const overBalance = usdcNum > availNum + 1e-9;
 
   // withdraw-currency helpers
@@ -219,17 +247,26 @@ export default function Withdraw() {
   async function withdraw(kind) {
     setError(""); setDone("");
     // Empty fiat input = withdraw MAX. Otherwise the entered fiat is converted to
-    // USDC (÷ rate). "0"/negative is rejected rather than coerced into "everything".
+    // USDC via the on-chain sellPrice. "0"/negative is rejected rather than
+    // coerced into "everything".
     const isMax = typedFiat === "";
+    // A non-max fiat withdraw MUST have the live sell price — never size an
+    // offramp off a guessed rate, or the delivered fiat won't match what was typed.
+    if (!isMax && !sellPrice) {
+      return setError("Live rate is still loading — one moment.");
+    }
     const sendUsdc = isMax ? availNum : usdcNum;
     if (!isMax && sendUsdc <= 0) return setError("Enter an amount greater than zero.");
     if (sendUsdc > availNum + 1e-9) return setError("Amount exceeds your available balance.");
 
     // Exact on-chain `available` bigint for a MAX withdraw (or when the converted
     // amount meets/exceeds the balance) so float rounding can't push the raw
-    // amount 1 unit over and revert; otherwise convert the USDC amount.
+    // amount 1 unit over and revert; otherwise use the EXACT on-chain-derived
+    // bigint (no float round-trip) from the sell price.
     const useExactMax = isMax || sendUsdc >= availNum;
-    const raw = useExactMax ? (available as bigint) : BigInt(Math.round(sendUsdc * 1e6));
+    const raw = useExactMax
+      ? (available as bigint)
+      : usdcForFiatSell(Number(typedFiat) || 0, sellPrice);
 
     // FIAT: hand off to the official Cashout widget. It collects + encrypts the
     // payout FRESH in its own UI and runs the full offramp lifecycle — it does
@@ -328,7 +365,7 @@ export default function Withdraw() {
           <div className="balance-label">{t("wd.ready")}</div>
           <div className="balance-amount" style={{ fontSize: 42 }}>${availNum.toFixed(2)}</div>
           <div className="balance-sub">
-            {availFiat != null ? `≈ ${fmtFiat(country, availFiat)} ${country.code}` : "≈ —"}
+            {availFiat != null ? `≈ ${fmtFiat(wdCountry, availFiat)} ${wdCode}` : "≈ —"}
             {Number(pending) > 0 ? ` · ${fmtUsdc(pending)} still settling` : ""}
           </div>
         </div>
@@ -349,18 +386,26 @@ export default function Withdraw() {
         )}
 
         <div className="wd-card">
-          <label className="wd-label">{t("wd.amount")} ({country.code})</label>
+          <label className="wd-label">{t("wd.amount")} ({wdCode})</label>
           <div className="wd-amt-row">
             {/* Amount entered in LOCAL FIAT (₹/R$/…) with the currency symbol; the
-                USDC equivalent is shown small below. */}
+                USDC equivalent is shown small below. Uses the WITHDRAW currency
+                (wdCountry), which is what the sell price + settlement key off. */}
             <div className="wd-fiat-input" style={{ display: "flex", alignItems: "center", flex: 1, gap: 6 }}>
-              <span className="wd-fiat-sym" style={{ fontWeight: 700, color: "var(--muted)" }}>{country.symbol}</span>
+              <span className="wd-fiat-sym" style={{ fontWeight: 700, color: "var(--muted)" }}>{wdCountry?.symbol}</span>
               <input className="input" type="number" min="0" step="0.01"
                 placeholder={availFiat != null ? availFiat.toFixed(2) : "0.00"} value={amount}
                 onChange={(e) => setAmount(e.target.value)} style={{ flex: 1 }} />
             </div>
+            {/* MAX = clear the field. Empty is the "withdraw everything" path,
+                which uses the EXACT on-chain `available` bigint (no fiat rounding).
+                Setting the field to availFiat.toFixed(2) instead would round the
+                fiat UP vs the real balance, convert back to slightly-more USDC,
+                trip the overBalance guard, and disable BOTH withdraw buttons — so
+                the merchant could never cash out their full balance. The placeholder
+                already shows the full amount and the hint shows "· MAX". */}
             <button className="btn secondary small" type="button"
-              onClick={() => setAmount(availFiat != null ? availFiat.toFixed(2) : "")}>{t("wd.max")}</button>
+              onClick={() => setAmount("")}>{t("wd.max")}</button>
           </div>
           {/* small USDC equivalent of whatever fiat is typed */}
           <div className="wd-usdc-hint muted" style={{ fontSize: 12, marginTop: 6 }}>
@@ -437,18 +482,21 @@ export default function Withdraw() {
           we can't convert it yet — show a hint and disable withdraw (rather than
           coercing the conversion to 0 and rejecting a valid amount). An empty
           (MAX) input needs no rate, so it stays enabled. */}
-      {typedFiat !== "" && !rate && (
+      {sellErr && (
+        <p className="muted" style={{ textAlign: "center", fontSize: 12 }}>{sellErr}</p>
+      )}
+      {typedFiat !== "" && !sellPrice && !sellErr && (
         <p className="muted" style={{ textAlign: "center", fontSize: 12 }}>{t("wd.fetchingRate")}</p>
       )}
 
       <div className="bottombar" style={{ flexDirection: "column", gap: 10 }}>
         <button className="btn" style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
-          disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !rate)}
+          disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !sellPrice)}
           onClick={() => withdraw("fiat")}>
           <Icon.Bank /> {busy === "fiat" ? t("wd.working") : `${t("wd.sendToBank")} ${wdCountry?.fiat}`}
         </button>
         <button className="btn dark" style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
-          disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !rate)}
+          disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !sellPrice)}
           onClick={() => withdraw("usdc")}>
           <Icon.Wallet /> {busy === "usdc" ? t("wd.working") : t("wd.keepUsdc")}
         </button>

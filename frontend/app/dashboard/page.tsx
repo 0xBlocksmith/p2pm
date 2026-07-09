@@ -11,7 +11,7 @@ import { AppTour } from "../../components/AppTour";
 import { ConnectionBanner } from "../../components/ConnectionBanner";
 import { WalletSheet } from "../../components/WalletSheet";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, fmtUsdc } from "../../lib/contract";
-import { fetchUsdcRate } from "../../lib/rates";
+import { fetchOnchainSellPrice } from "../../lib/price";
 import { fetchHistory } from "../../lib/history";
 import { loadCountry, fmtFiat } from "../../lib/countries";
 import { useT } from "../../lib/i18n";
@@ -92,10 +92,15 @@ export default function Dashboard() {
   }, []);
 
   useEffect(() => {
-    if (!country) return;
+    if (!country?.code) return;
     let on = true;
-    fetchUsdcRate(country).then((r) => on && setRate(r)).catch(() => {});
-    return () => { on = false; };
+    const load = () =>
+      fetchOnchainSellPrice(country.code)
+        .then((r) => on && setRate(r))
+        .catch(() => on && setRate(null));
+    load();
+    const t = setInterval(load, 60000);
+    return () => { on = false; clearInterval(t); };
   }, [country]);
 
   useEffect(() => {
@@ -116,6 +121,11 @@ export default function Dashboard() {
   // refetches, a locked bucket just cleared — tell the merchant their money is
   // ready to withdraw. (Skips the first read so we don't toast on page load.)
   const prevAvail = useRef(null);
+  // Single reusable timer for the settlement toast. Held in a ref so a second
+  // clear-event within 6s cancels the prior timeout (instead of the first timer
+  // hiding the newer toast early / timers stacking), and so a pending timeout is
+  // cancelled on unmount (no setToast after the dashboard is gone).
+  const toastTimer = useRef(null);
   useEffect(() => {
     if (balance === undefined) return;
     const cur = available;
@@ -123,10 +133,13 @@ export default function Dashboard() {
       const cleared = Number(cur - prevAvail.current) / 1e6;
       const fiat = rate && country ? fmtFiat(country, cleared * rate.rate) : `${cleared.toFixed(2)} USDC`;
       setToast(`${fiat} just cleared — ready to withdraw`);
-      setTimeout(() => setToast(""), 6000);
+      if (toastTimer.current) clearTimeout(toastTimer.current);
+      toastTimer.current = setTimeout(() => setToast(""), 6000);
     }
     prevAvail.current = cur;
   }, [available, balance, rate, country]);
+  // Cancel any pending toast timer on unmount.
+  useEffect(() => () => { if (toastTimer.current) clearTimeout(toastTimer.current); }, []);
 
   // Soonest still-locked bucket → seconds until it unlocks (for the countdown).
   const lockedBuckets = (buckets || []).filter(
@@ -157,16 +170,26 @@ export default function Dashboard() {
   // itself after a timeout). So "Dismiss" here is a LOCAL hide: it removes the
   // row from this merchant's view. The order still resolves on-chain on its own
   // (it will show as cancelled once the protocol times it out).
-  const stuck = rows.find(
+  const stuckOrders = rows.filter(
     (t) =>
       t.status === "matching" &&
       !dismissed.includes(String(t.orderId)) &&
       (Date.now() - new Date(t.createdAt).getTime()) > 180_000
   );
-  function dismissStuck(orderId) {
-    const next = [...dismissed, String(orderId)];
+  const stuck = stuckOrders[0]; // the one shown in the card (oldest-first from rows)
+  function persistDismissed(next) {
     setDismissed(next);
     try { localStorage.setItem("payqr.dismissedStuck", JSON.stringify(next)); } catch {}
+  }
+  function dismissStuck(orderId) {
+    persistDismissed([...dismissed, String(orderId)]);
+  }
+  // Bulk hide EVERY stuck sale at once. This is a LOCAL hide only — there is no
+  // merchant on-chain cancel (see the note above); the protocol still times each
+  // order out on-chain. Dedupes into the existing dismissed set.
+  function dismissAllStuck() {
+    const ids = stuckOrders.map((t) => String(t.orderId));
+    persistDismissed(Array.from(new Set([...dismissed, ...ids])));
   }
 
   // Daily close ("Z-report") — what a shop owner screenshots at end of day for
@@ -259,16 +282,22 @@ export default function Dashboard() {
             or a local dismiss (there's no merchant on-chain cancel; the protocol
             times the order out itself). */}
         {stuck && (
-          <div className="stuck-card" style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 14px", borderRadius: 12, border: "1px solid var(--warn-border, #e0b100)", background: "var(--warn-soft, rgba(224,177,0,.08))", margin: "12px 0" }}>
+          <div className="stuck-card" style={{ display: "flex", alignItems: "center", gap: 10, padding: "12px 14px", borderRadius: 12, border: "1px solid var(--warn-border, #e0b100)", background: "var(--warn-soft, rgba(224,177,0,.08))", margin: "12px 0", flexWrap: "wrap" }}>
             <span className="stuck-ico"><Icon.Clock /></span>
-            <div style={{ flex: 1 }}>
+            <div style={{ flex: 1, minWidth: 0 }}>
               <div style={{ fontWeight: 700 }}>{t("dash.stuckTitle")}</div>
               <div className="muted" style={{ fontSize: 12 }}>
                 #{stuck.orderId} · {fmtUsdc(stuck.amount)} USDC · {timeAgo(stuck.createdAt)}
+                {stuckOrders.length > 1 && <> · +{stuckOrders.length - 1} more waiting</>}
               </div>
             </div>
             <button className="btn small secondary" onClick={acceptPayment}>{t("dash.newSale")}</button>
             <button className="btn small ghost" onClick={() => dismissStuck(stuck.orderId)}>{t("dash.dismiss")}</button>
+            {stuckOrders.length > 1 && (
+              <button className="btn small ghost" onClick={dismissAllStuck}>
+                {t("dash.dismiss")} all ({stuckOrders.length})
+              </button>
+            )}
           </div>
         )}
 

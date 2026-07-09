@@ -48,6 +48,19 @@ export default function Onboarding() {
     if (isRegistered === true) router.replace("/dashboard");
   }, [isRegistered, router]);
 
+  // Read the on-chain `registered` flag FRESH (bypassing the cached wagmi query),
+  // so we never act on a stale `false`. Returns true/false, or null if the read
+  // itself fails (treat as "unknown", don't block on it).
+  async function isRegisteredOnchain() {
+    if (!publicClient || !address) return null;
+    try {
+      return await publicClient.readContract({
+        address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI,
+        functionName: "registered", args: [address],
+      } as any) as boolean;
+    } catch { return null; }
+  }
+
   async function submit(e) {
     e.preventDefault();
     setError("");
@@ -57,6 +70,15 @@ export default function Onboarding() {
     }
     setBusy(true);
     try {
+      // A previous attempt may have actually landed on-chain even if its receipt
+      // wait timed out — in which case re-submitting reverts with AlreadyRegistered
+      // (surfaced opaquely as "Execution Reverted: {}"). Check the live flag first
+      // and just continue to the terminal if we're already set up.
+      if (await isRegisteredOnchain()) {
+        try { await refetchRegistered?.(); } catch {}
+        router.replace("/qr");
+        return;
+      }
       // Wait for the smart wallet to initialise (it can take a few seconds on
       // first login). Read via ref so we see it appear.
       let tries = 0;
@@ -103,13 +125,36 @@ export default function Onboarding() {
       // They came here from "Accept Payment" — continue to the terminal.
       router.replace("/qr");
     } catch (err) {
-      console.error("register failed:", err);
-      const raw = String(err?.shortMessage || err?.details || err?.message || "");
+      // Log the FULL error object — thirdweb/bundler nests the real reason
+      // (paymaster declined, account-deploy failure, revert reason) in fields that
+      // the flattened string below often loses. Essential for diagnosing the
+      // opaque "Execution Reverted: {}" that the AA path produces.
+      console.error("register failed (full):", err);
+      try { console.error("register failed (json):", JSON.stringify(err, Object.getOwnPropertyNames(err || {}))); } catch {}
+      const raw = String(
+        err?.shortMessage || err?.details || err?.reason ||
+        err?.cause?.shortMessage || err?.cause?.message || err?.message || ""
+      );
+      // The revert might be AlreadyRegistered — meaning a prior attempt DID land.
+      // The AA/RPC path often strips the custom-error data, so this surfaces as an
+      // opaque "Execution Reverted: {}". Re-check the live flag: if we're actually
+      // registered, this "failure" is a success we just couldn't read — go on.
+      if (/revert|reverted|already/i.test(raw)) {
+        if (await isRegisteredOnchain()) {
+          try { await refetchRegistered?.(); } catch {}
+          router.replace("/qr");
+          return;
+        }
+      }
       if (/User rejected|reject|denied/i.test(raw)) {
         setError("Cancelled.");
       } else if (/5\d\d|522|504|timed out|timeout|Unexpected token|not valid JSON|network|fetch failed/i.test(raw)) {
         // Transient thirdweb bundler/paymaster infra error (already auto-retried).
         setError("Network hiccup reaching the gas-free wallet service. Please tap again in a moment.");
+      } else if (/revert|reverted/i.test(raw)) {
+        // A real on-chain revert whose reason the RPC didn't return (empty data →
+        // "{}"). Don't show the raw "{}" — give an actionable message.
+        setError("Setup couldn't be completed on-chain. Please check your details and try again.");
       } else {
         setError(`Setup failed: ${raw || "please try again"}`);
       }

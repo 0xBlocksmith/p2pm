@@ -6,7 +6,7 @@ import { useReadContract } from "wagmi";
 import { Nav } from "../../components/Nav";
 import { useMerchant } from "../../components/useMerchant";
 import { Icon } from "../../components/Icons";
-import { CONTRACT_ADDRESS, INTEGRATOR_ABI, perTxCapUsdc, currencyFromBytes32 } from "../../lib/contract";
+import { CONTRACT_ADDRESS, INTEGRATOR_ABI, perTxCapUsdc, currencyFromBytes32, USDC_UNIT } from "../../lib/contract";
 import { fetchOnchainPrice, quoteFromFiat, PriceNotConfiguredError, type OnchainPrice, type Quote } from "../../lib/price";
 import { STATIC_STALE_MS, loadMerchantProfile, saveMerchantProfile } from "../../lib/cache";
 import { loadCountry, fmtFiat, COUNTRIES, getCountry } from "../../lib/countries";
@@ -236,8 +236,8 @@ export default function PosQr() {
   if (price && amtNum > 0) {
     if (inputMode === "usdc") {
       const usdcAmount = BigInt(Math.round(amtNum * 1e6));
-      const quantity = (usdcAmount + 5_000n) / 10_000n;
-      const snapped = quantity * 10_000n;
+      const quantity = (usdcAmount + USDC_UNIT / 2n) / USDC_UNIT;
+      const snapped = quantity * USDC_UNIT;
       const feeUsdc =
         price.smallOrderThreshold > 0n && snapped > 0n && snapped <= price.smallOrderThreshold
           ? price.smallOrderFixedFee : 0n;

@@ -163,10 +163,18 @@ export function friendlyError(e: any, fallback = "Something went wrong. Please t
   return ERROR_MESSAGES[name] || fallback;
 }
 
-// Fine-grained pricing product: id 2 @ 0.01 USDC/unit, so any INR amount
-// maps to a quantity of cents (quantity = usdc * 100).
+// Fine-grained pricing product: id 2 @ 0.000001 USDC/unit (one 6-dec USDC unit),
+// so the on-chain order total can land on any exact 6-dec USDC amount — quantity
+// is a 1:1 count of 6-dec units (quantity == usdcAmount). This removes the old
+// whole-cent grid that made small fiat orders miss the typed amount by up to
+// ~half a cent of USDC (e.g. ~₹0.45 at 91 INR/USDC).
+// NOTE: the on-chain client MUST be configured to match — setProductPrice(2, 1).
 export const PRODUCT_ID = 2n;
-export const UNIT_PRICE_USDC = 0.01;
+export const UNIT_PRICE_USDC = 0.000001;
+// The USDC order total must be a whole multiple of this many 6-dec units. At a
+// unit price of 0.000001 USDC that's 1 (full precision). Drive all quantization
+// off this constant so a future on-chain unit change is a one-line edit here.
+export const USDC_UNIT = 1n; // 6-dec units per product-2 unit
 // Per-transaction cap defaults: India (INR) 50 USDC, every other market 100 USDC.
 // NOTE: these are only a LOADING-STATE FALLBACK. The qr terminal reads the LIVE
 // perTxCap(currency) from the contract so it always reflects the real cap —

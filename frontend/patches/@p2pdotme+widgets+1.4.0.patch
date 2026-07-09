@@ -1,0 +1,19 @@
+diff --git a/node_modules/@p2pdotme/widgets/dist/checkout.js b/node_modules/@p2pdotme/widgets/dist/checkout.js
+index a1f658d..f0ba7c5 100644
+--- a/node_modules/@p2pdotme/widgets/dist/checkout.js
++++ b/node_modules/@p2pdotme/widgets/dist/checkout.js
+@@ -1368,8 +1368,12 @@ function Checkout(props) {
+                 /* @__PURE__ */ jsx("p", { style: { ...S.label, marginBottom: 4 }, children: field.label }),
+                 /* @__PURE__ */ jsx(CopyRow, { value: compoundParts[i] ?? "\u2026", copied: copied === field.key, onCopy: () => copy(compoundParts[i], field.key) })
+               ] }, field.key)) }) : state.decryptedUpi ? /* @__PURE__ */ jsx(CopyRow, { value: state.decryptedUpi, copied: copied === "upi", onCopy: () => copy(state.decryptedUpi, "upi") }) : /* @__PURE__ */ jsx("p", { style: S.muted, children: "Decrypting payment details\u2026" }) }),
+-              state.decryptedUpi && state.currency === "INR" && /* @__PURE__ */ jsx("div", { style: { display: "flex", justifyContent: "center", marginTop: 16 }, children: /* @__PURE__ */ jsx("div", { style: { padding: 12, background: "#fff", borderRadius: radius.md, border: `1px solid ${color.border}` }, children: /* @__PURE__ */ jsx("img", { src: `https://api.qrserver.com/v1/create-qr-code/?size=200x200&margin=0&data=${encodeURIComponent(
+-                `upi://pay?pa=${state.decryptedUpi}&am=${fiatDisplay}&cu=INR&tr=${state.orderId}`
++              state.decryptedUpi && !compoundFields && /* @__PURE__ */ jsx("div", { style: { display: "flex", justifyContent: "center", marginTop: 16 }, children: /* @__PURE__ */ jsx("div", { style: { padding: 12, background: "#fff", borderRadius: radius.md, border: `1px solid ${color.border}` }, children: /* @__PURE__ */ jsx("img", { src: `https://api.qrserver.com/v1/create-qr-code/?size=200x200&margin=0&data=${encodeURIComponent(
++                // INR/UPI needs the upi:// intent URI so UPI apps can parse the
++                // amount. Every other single-handle currency (BRL/PIX "copia e
++                // cola", aliases, phone numbers, etc.) is scannable AS-IS — the
++                // decrypted handle IS the QR payload — so encode it verbatim.
++                state.currency === "INR" ? `upi://pay?pa=${state.decryptedUpi}&am=${fiatDisplay}&cu=INR&tr=${state.orderId}` : state.decryptedUpi
+               )}`, alt: "QR", style: { width: 180, height: 180, display: "block" } }) }) })
+             ] }),
+             state.error && /* @__PURE__ */ jsx("div", { style: { marginTop: 12, padding: "10px 12px", background: color.dangerSoft, borderRadius: radius.md, color: color.danger, fontSize: font.md }, children: state.error }),

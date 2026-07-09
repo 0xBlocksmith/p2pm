@@ -42,10 +42,13 @@ const config: HardhatUserConfig = {
     },
   },
   etherscan: {
-    apiKey: {
-      base: process.env.BASESCAN_API_KEY || "",
-      baseSepolia: process.env.BASESCAN_API_KEY || "",
-    },
+    // Etherscan API v2 uses a SINGLE key across all chains (the old per-network
+    // map hits a deprecated v1 endpoint that now rejects requests). Basescan
+    // verification goes through the unified etherscan.io v2 API keyed by chainId.
+    apiKey: process.env.BASESCAN_API_KEY || process.env.ETHERSCAN_API_KEY || "",
+  },
+  sourcify: {
+    enabled: false,
   },
   paths: {
     sources: "./contracts",

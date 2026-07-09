@@ -6,10 +6,12 @@ import { encodeFunctionData } from "viem";
 import { useReadContract, usePublicClient } from "wagmi";
 import { Nav } from "../../components/Nav";
 import { useMerchant } from "../../components/useMerchant";
+import { useRelayIdentity } from "../../components/useRelayIdentity";
 import { Icon } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, fmtUsdc, currencyFromBytes32, friendlyError } from "../../lib/contract";
 import { STATIC_STALE_MS } from "../../lib/cache";
-import { fetchUsdcRate } from "../../lib/rates";
+import { encryptPayout, decryptPayout } from "../../lib/payoutCrypto";
+import { fetchOnchainSellPrice, usdcForFiatSell, PriceNotConfiguredError } from "../../lib/price";
 import { loadCountry, fmtFiat, COUNTRIES } from "../../lib/countries";
 import { buildUsdcWithdraw } from "../../lib/withdraw";
 import { fetchWithdrawals } from "../../lib/history";
@@ -34,6 +36,7 @@ function fmtRemaining(secs) {
 
 export default function Withdraw() {
   const { ready, address, sendTransaction } = useMerchant();
+  const { getIdentity } = useRelayIdentity();
   const publicClient = usePublicClient();
   const { t } = useT();
 
@@ -45,7 +48,12 @@ export default function Withdraw() {
   const [wdCode, setWdCode] = useState("");          // the currency to withdraw IN
   const [otherOpts, setOtherOpts] = useState([]);    // all countries (+ live flag)
   const [otherOpen, setOtherOpen] = useState(false);
-  const [rate, setRate] = useState(null);
+  // ON-CHAIN SELL price for the currency being withdrawn IN (wdCode). This is the
+  // rate the offramp actually settles at, so the merchant's typed fiat payout
+  // matches what the Cashout widget delivers — same fix as the Accept page's buy
+  // price. Keyed off wdCode (the SELL currency), NOT the display country.
+  const [sellPrice, setSellPrice] = useState(null);
+  const [sellErr, setSellErr] = useState("");        // clear msg when a currency isn't priced
   const [now, setNow] = useState(Math.floor(Date.now() / 1000));
   const [cashout, setCashout] = useState(null); // active fiat cash-out (Cashout widget)
   const [payoutChoice, setPayoutChoice] = useState("saved"); // "saved" | "new"
@@ -75,14 +83,30 @@ export default function Withdraw() {
     const t = setInterval(() => setNow(Math.floor(Date.now() / 1000)), 1000);
     return () => clearInterval(t);
   }, [cashout]);
+  // Live on-chain SELL price for the withdraw currency. Refetched when the
+  // merchant switches withdraw currency; cleared on failure so the amount field
+  // shows a "loading rate" state rather than converting off a stale/guessed rate.
   useEffect(() => {
-    if (!country) return;
+    if (!wdCode) return;
     let on = true;
     // "sell" price: withdrawal converts the merchant's USDC → fiat, so the
-    // "≈ X" figures must use the cash-OUT rate, not the customer buy price.
-    fetchUsdcRate(country, "sell").then((r) => on && setRate(r)).catch(() => {});
-    return () => { on = false; };
-  }, [country]);
+    // "≈ X" figures must use the cash-OUT (on-chain SELL) rate, not the buy price.
+    const load = () =>
+      fetchOnchainSellPrice(wdCode)
+        .then((p) => { if (on) { setSellPrice(p); setSellErr(""); } })
+        .catch((e) => {
+          if (!on) return;
+          setSellPrice(null);
+          setSellErr(
+            e instanceof PriceNotConfiguredError
+              ? `Withdrawals in ${wdCode} aren't available yet.`
+              : ""
+          );
+        });
+    load();
+    const t = setInterval(load, 60_000);
+    return () => { on = false; clearInterval(t); };
+  }, [wdCode]);
 
   const { data: buckets } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "getMerchantBuckets",
@@ -110,15 +134,32 @@ export default function Withdraw() {
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "proxyAddress",
     args: [address], query: { enabled: !!address && inFlight > 0, staleTime: STATIC_STALE_MS },
   });
-  // Is the connected wallet the contract OWNER? Only the owner can run the admin
+  // Is the connected wallet a contract OWNER? Only an owner can run the admin
   // recovery (freeze → adminAbort → unfreeze) that frees an order the LP left
-  // stuck at "matching" (which reconcileWithdrawal alone can't).
-  const { data: ownerAddr } = useReadContract({
-    address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "owner",
-    query: { enabled: inFlight > 0, staleTime: STATIC_STALE_MS },
+  // stuck at "matching" (which reconcileWithdrawal alone can't). The contract is
+  // MULTI-OWNER (no owner() getter) — check membership via isOwner(address).
+  const { data: ownerFlag } = useReadContract({
+    address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "isOwner",
+    args: [address as `0x${string}`], query: { enabled: !!address && inFlight > 0 },
   });
-  const isOwner = !!address && !!ownerAddr && (address as string).toLowerCase() === (ownerAddr as string).toLowerCase();
-  const savedPayout = info?.[0] || "";
+  const isOwner = !!ownerFlag;
+  // info[0] is now the ENCRYPTED payout blob — decrypt it client-side for the
+  // "use saved" option. null when not decryptable on this device (different relay
+  // key); we then only offer "enter a new one".
+  const encSaved = (info?.[0] as string) || "";
+  const [savedPayout, setSavedPayout] = useState("");
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      if (!encSaved || encSaved === "0x") { if (alive) setSavedPayout(""); return; }
+      try {
+        const id = await getIdentity();
+        const plain = await decryptPayout(encSaved, id);
+        if (alive) setSavedPayout(plain || "");
+      } catch { if (alive) setSavedPayout(""); }
+    })();
+    return () => { alive = false; };
+  }, [encSaved, getIdentity]);
 
   async function sendAndWait(functionName: string, args: any[]) {
     const data = encodeFunctionData({ abi: INTEGRATOR_ABI, functionName, args } as any);
@@ -183,13 +224,16 @@ export default function Withdraw() {
   const registeredCode = currencyFromBytes32(info?.[2] as string);
   const [pending, available] = balance ?? [0n, 0n];
   const availNum = Number(available) / 1e6;               // withdrawable (unlocked) USDC
-  const availFiat = rate ? availNum * rate.rate : null;   // withdrawable in local fiat
+  // Withdrawable in local fiat, at the ON-CHAIN sell rate the offramp settles at
+  // (not an off-chain guess) — so the "≈ ₹X" preview matches what a full cash-out
+  // would actually deliver.
+  const availFiat = sellPrice ? availNum * sellPrice.rate : null;
   // ACCOUNT BALANCE = everything the contract holds for this merchant, matured
   // or not (pending = still-locked buckets + available = unlocked). NOT
   // totalDeposited, which is a lifetime counter that never decreases.
   const pendingNum = Number(pending) / 1e6;
   const accountNum = pendingNum + availNum;               // total USDC in contract
-  const accountFiat = rate ? accountNum * rate.rate : null;
+  const accountFiat = sellPrice ? accountNum * sellPrice.rate : null;
   // Soonest unlock across the locked buckets → drives the maturity note with the
   // REAL on-chain wait (this build settles in ~10 min; prod uses 30 days). We
   // read the actual timestamp rather than hardcode a period that may be wrong.
@@ -200,15 +244,17 @@ export default function Withdraw() {
   const nextUnlockSecs = nextUnlock === Infinity ? 0 : Math.max(0, nextUnlock - now);
 
   // The AMOUNT FIELD is entered in LOCAL FIAT (₹ / R$ / …) for the bank path —
-  // what a shopkeeper thinks in — and converted to USDC under the hood. Empty =
-  // withdraw MAX. On the USDC path the same field is USDC directly, no
-  // conversion needed.
+  // what a shopkeeper thinks in — and converted to USDC under the hood using the
+  // on-chain SELL price. Empty = withdraw MAX. On the USDC path the same field is
+  // USDC directly, no conversion needed.
   const typedFiat = amount.trim();
-  // fiat the user wants → USDC (÷ rate). Empty means "everything".
+  // fiat the user wants → USDC via the on-chain sellPrice. Empty means "everything".
   const fiatNum = typedFiat === "" ? availFiat ?? 0 : (Number(typedFiat) || 0);
   const usdcNum = typedFiat === ""
     ? availNum
-    : destChoice === "usdc" ? (Number(typedFiat) || 0) : (rate ? fiatNum / rate.rate : 0);
+    : destChoice === "usdc"
+      ? (Number(typedFiat) || 0)
+      : (sellPrice ? Number(usdcForFiatSell(Number(typedFiat) || 0, sellPrice)) / 1e6 : 0);
   const overBalance = usdcNum > availNum + 1e-9;
 
   // withdraw-currency helpers
@@ -229,37 +275,60 @@ export default function Withdraw() {
   async function withdraw(kind) {
     setError(""); setDone("");
     // Empty fiat input = withdraw MAX. Otherwise the entered fiat is converted to
-    // USDC (÷ rate). "0"/negative is rejected rather than coerced into "everything".
+    // USDC via the on-chain sellPrice. "0"/negative is rejected rather than
+    // coerced into "everything".
     const isMax = typedFiat === "";
+    // A non-max fiat withdraw MUST have the live sell price — never size an
+    // offramp off a guessed rate, or the delivered fiat won't match what was typed.
+    if (!isMax && !sellPrice) {
+      return setError("Live rate is still loading — one moment.");
+    }
     const sendUsdc = isMax ? availNum : usdcNum;
     if (!isMax && sendUsdc <= 0) return setError("Enter an amount greater than zero.");
     if (sendUsdc > availNum + 1e-9) return setError("Amount exceeds your available balance.");
 
     // Exact on-chain `available` bigint for a MAX withdraw (or when the converted
     // amount meets/exceeds the balance) so float rounding can't push the raw
-    // amount 1 unit over and revert; otherwise convert the USDC amount.
+    // amount 1 unit over and revert; otherwise use the EXACT on-chain-derived
+    // bigint (no float round-trip) from the sell price.
     const useExactMax = isMax || sendUsdc >= availNum;
-    const raw = useExactMax ? (available as bigint) : BigInt(Math.round(sendUsdc * 1e6));
+    const raw = useExactMax
+      ? (available as bigint)
+      : usdcForFiatSell(Number(typedFiat) || 0, sellPrice);
 
-    // FIAT: hand off to the official Cashout widget. It collects/encrypts the
-    // payout and runs the full offramp lifecycle. Before opening it, we let the
-    // merchant confirm which payout handle to use (saved or a new one) — if they
-    // chose a NEW one we persist it on-chain via updateProfile so the widget
-    // picks it up. (The widget itself is what actually encrypts + delivers it.)
+    // FIAT: hand off to the official Cashout widget. It collects + encrypts the
+    // payout FRESH in its own UI and runs the full offramp lifecycle — it does
+    // NOT read our on-chain handle. So persisting a "new" default handle here is
+    // a pure convenience (updates the merchant's saved default for next time); it
+    // must NEVER block the withdraw. We validate it, then save BEST-EFFORT.
     if (kind === "fiat") {
-      // If the merchant picked "new" and typed a handle, save it on-chain first.
+      // If the merchant picked "new" and typed a handle, validate + save it as
+      // their default (encrypted client-side — the raw handle never goes on-chain).
+      // A failed/reverted save is non-fatal: we still open the widget.
       if (payoutChoice === "new" && newPayout.trim() && newPayout.trim() !== savedPayout) {
-        setBusy("fiat");
-        try {
-          const data = encodeFunctionData({
-            abi: INTEGRATOR_ABI, functionName: "updateProfile",
-            args: [newPayout.trim(), info?.[1] || "Shop"],
-          });
-          const hash = await sendTransaction({ to: CONTRACT_ADDRESS, data });
-          const rc = await publicClient.waitForTransactionReceipt({ hash });
-          if (rc.status === "reverted") throw new Error("Couldn't save the new payout id.");
-        } catch (err) {
-          setBusy(""); return setError(friendlyError(err, "Couldn't save your payout ID."));
+        // Validate on plaintext, same guard as onboarding/settings.
+        if (wdCountry?.validatePayout && !wdCountry.validatePayout(newPayout.trim())) {
+          return setError(`Enter a valid ${wdCountry.payoutLabel} (like ${wdCountry.payoutPlaceholder}).`);
+        }
+        // Only touch shopName if we actually have it loaded, so we never clobber
+        // the real name with a placeholder.
+        const currentShop = (info?.[1] as string) || "";
+        if (currentShop) {
+          setBusy("fiat");
+          try {
+            const identity = await getIdentity();
+            const encNew = await encryptPayout(newPayout.trim(), identity);
+            const data = encodeFunctionData({
+              abi: INTEGRATOR_ABI, functionName: "updateProfile",
+              args: [encNew, currentShop],
+            });
+            const hash = await sendTransaction({ to: CONTRACT_ADDRESS, data });
+            await publicClient.waitForTransactionReceipt({ hash });
+            // Best-effort: even if it reverted, fall through to the widget — the
+            // widget collects the payout itself and doesn't need the saved copy.
+          } catch {
+            /* non-fatal — saving the default handle is optional; proceed to cash out */
+          }
         }
         setBusy("");
       }
@@ -361,20 +430,21 @@ export default function Withdraw() {
         {/* TWO balance figures, side by side, so the merchant sees at a glance
             what they HAVE (account balance = everything in the contract) vs what
             they can withdraw RIGHT NOW (matured/unlocked). The gap is funds still
-            in the settlement window. */}
+            in the settlement window. Fiat previews use the on-chain SELL rate for
+            the WITHDRAW currency (wdCountry/wdCode). */}
         <div className="wd-balances">
           <div className="wd-bal-box">
             <div className="wd-bal-label">{t("wd.accountBalance")}</div>
             <div className="wd-bal-amt">${accountNum.toFixed(2)}</div>
             <div className="wd-bal-sub">
-              {accountFiat != null ? `≈ ${fmtFiat(country, accountFiat)} ${country.code}` : "≈ —"}
+              {accountFiat != null ? `≈ ${fmtFiat(wdCountry, accountFiat)} ${wdCode}` : "≈ —"}
             </div>
           </div>
           <div className="wd-bal-box">
             <div className="wd-bal-label">{t("wd.withdrawable")}</div>
             <div className="wd-bal-amt">${availNum.toFixed(2)}</div>
             <div className="wd-bal-sub">
-              {availFiat != null ? `≈ ${fmtFiat(country, availFiat)} ${country.code}` : "≈ —"}
+              {availFiat != null ? `≈ ${fmtFiat(wdCountry, availFiat)} ${wdCode}` : "≈ —"}
             </div>
           </div>
         </div>
@@ -440,12 +510,13 @@ export default function Withdraw() {
             </button>
 
             <div className="wd-card">
-              <label className="wd-label">{t("wd.amount")} ({country.code})</label>
+              <label className="wd-label">{t("wd.amount")} ({wdCode})</label>
               <div className="wd-amt-row">
                 {/* Amount entered in LOCAL FIAT (₹/R$/…) with the currency symbol; the
-                    USDC equivalent is shown small below. */}
+                    USDC equivalent is shown small below. Uses the WITHDRAW currency
+                    (wdCountry), which the on-chain sell price + settlement key off. */}
                 <div className="wd-fiat-input" style={{ display: "flex", alignItems: "center", flex: 1, gap: 6 }}>
-                  <span className="wd-fiat-sym" style={{ fontWeight: 700, color: "var(--muted)" }}>{country.symbol}</span>
+                  <span className="wd-fiat-sym" style={{ fontWeight: 700, color: "var(--muted)" }}>{wdCountry?.symbol}</span>
                   <input className="input" type="number" min="0" step="0.01"
                     placeholder={availFiat != null ? availFiat.toFixed(2) : "0.00"} value={amount}
                     onChange={(e) => setAmount(e.target.value)} style={{ flex: 1 }} />
@@ -526,12 +597,15 @@ export default function Withdraw() {
                 we can't convert it yet — show a hint and disable withdraw (rather than
                 coercing the conversion to 0 and rejecting a valid amount). An empty
                 (MAX) input needs no rate, so it stays enabled. */}
-            {typedFiat !== "" && !rate && (
+            {typedFiat !== "" && !sellPrice && !sellErr && (
               <p className="muted" style={{ textAlign: "center", fontSize: 12, marginTop: 10 }}>{t("wd.fetchingRate")}</p>
+            )}
+            {sellErr && (
+              <p className="muted" style={{ textAlign: "center", fontSize: 12, marginTop: 10 }}>{sellErr}</p>
             )}
 
             <button className="btn" style={{ width: "100%", marginTop: 16 }}
-              disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !rate)}
+              disabled={!!busy || !ready || availNum <= 0 || overBalance || (typedFiat !== "" && !sellPrice)}
               onClick={() => withdraw("fiat")}>
               {busy === "fiat" ? t("wd.working") : `${t("wd.sendToBank")} ${wdCountry?.fiat}`}
             </button>

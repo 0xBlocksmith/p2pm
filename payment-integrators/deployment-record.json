@@ -1,15 +1,36 @@
 {
   "network": "baseSepolia",
-  "note": "v10 (pre-whitelist audit): final audit pass (4 auditors, adversarial verify) — no CRITICAL/HIGH/MED contract findings. Cleaned stale 3-tier role comments (AdminRoleSet NatSpec + enum block) and removed dead NotManager error. Carries v9 5-tier hierarchical RBAC (NONE/VIEWER/SUPPORT/MANAGER/FINANCE, owner=FINANCE, onlyRole modifier, NotAuthorized error, isManager/isFinance/roleOf), v8 reconcile frozen re-lock, v7 payoutId/canonical-currency guards + admin-settable caps (INR 50/default 100) + dailyLimit (25) + finalizeWithdrawal. SETTLEMENT_PERIOD=10min. 73/73 tests. Bytecode EXACT on-chain, proxyImpl link verified. READY FOR WHITELIST.",
+  "note": "v12 (super-admin on BOTH integrator AND vault): same as v11 plus the vault now carries the UNREMOVABLE SUPER-ADMIN root — only super-admin can addOwner/removeOwner/setIntegrator + transferSuperAdmin; the kill-switch lock()/unlock() stays open to EVERY owner (broad break-glass). Segregated custody via airtight mutual handshake; client-side ECIES payout encryption; onOrderComplete/onOrderCancel nonReentrant; migrateState solvency sanity-guard. 101/101 tests. Adversarial audits (incl. vault super-admin): no CRITICAL/HIGH/MED, SHIP. On-chain state + mutual link + both super-admins verified. NOT source-verified on Basescan (per request). READY FOR WHITELIST.",
   "usdc": "0x4095fE4f1E636f11A95820BA2bB87F335Bd1040d",
   "diamond": "0xeb0BB8E3c014D915D9B2df03aBB130a1Fb44beb9",
-  "integrator": "0x66Fc15D3CC89f0090ca82A1308CbeBA85897E80e",
-  "proxyImpl": "0x5a8b584067E2AdE97fCc1Cb665885857221Bd587",
-  "client": "0x5C66483903bcDaAeC8Bc1735cc6D983Ab0ca98bC",
+  "vault": "0x6436336b7F4514df08B30f42A54928738F171073",
+  "integrator": "0xC78222FFead42c8fc05A128966eb29590aD384d3",
+  "proxyImpl": "0x3D81777bdCb3E9B3D4Be10704eB24984474e6Ce1",
+  "client": "0x733De42AE944f0eFF2895aA76E7d73F5e948FCb3",
   "deployer": "0x4f45446a6E934Fd03A353eC4DAc7Cd544f03d426",
-  "runtimeBytecodeKeccak": "0xe3acecbd0db1dab6ee8ea4a2dff22e484437a2599c8223f54f360de8d0b04ad9",
+  "superAdmin": "0x4f45446a6E934Fd03A353eC4DAc7Cd544f03d426",
+  "runtimeBytecodeKeccak": "0xa3a1146cab2fd69aca142870a2ef843412af1584cca0ce7e677d88780e27f6a9",
   "usdcThroughIntegrator": false,
+  "whitelistRequest": {
+    "integrator": "0xC78222FFead42c8fc05A128966eb29590aD384d3",
+    "proxyImpl": "0x3D81777bdCb3E9B3D4Be10704eB24984474e6Ce1",
+    "usdcThroughIntegrator": false,
+    "note": "Submit ONLY the integrator + proxyImpl. The vault is NOT whitelisted (it never calls the Diamond)."
+  },
   "previousBuilds": [
+    {
+      "note": "v11: super-admin on integrator only; vault still plain multi-owner (source-verified on Basescan)",
+      "vault": "0x39bf326c62C14464f2Fa4c4Bdd143388C69Dc468",
+      "integrator": "0x05653ECe4921E13088B2Bc7fDa53a89E27a1927d",
+      "proxyImpl": "0x6b82f1F6e81fB4Ec46135Ae45Cbb2D7E0F489E31",
+      "client": "0x1411dbFC688E501D953F48872f6f69C3B546abe2"
+    },
+    {
+      "note": "v10: pre-vault final audit (no vault/encryption/super-admin) — 73 tests",
+      "integrator": "0x66Fc15D3CC89f0090ca82A1308CbeBA85897E80e",
+      "proxyImpl": "0x5a8b584067E2AdE97fCc1Cb665885857221Bd587",
+      "client": "0x5C66483903bcDaAeC8Bc1735cc6D983Ab0ca98bC"
+    },
     {
       "note": "v9: 5-tier RBAC (VIEWER+FINANCE added)",
       "integrator": "0x0bFF06a3247D3d3E25F11D56A7A7e65e19a7943D",

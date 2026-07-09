@@ -19,11 +19,16 @@ payment-integrators/.git.bak/
 # machine-local dev deployment addresses
 backend/local-deployment.json
 
+# admin panel — kept out of the public repo (internal tooling)
+admin-panel/
+
+# throwaway on-chain probe / snapshot scripts (never committed)
+frontend/_*.mjs
+
 # editor / os
 .vscode/
 .DS_Store
 *.log
 .claude/
 
-PUSH.bat
 PUSH.bat

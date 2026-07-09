@@ -1,19 +1,15 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useReadContract } from "wagmi";
 import { Nav } from "../../components/Nav";
 import { useMerchant } from "../../components/useMerchant";
 import { Icon } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, perTxCapUsdc, currencyFromBytes32 } from "../../lib/contract";
-import { fetchUsdcRate } from "../../lib/rates";
-import { fetchPriceConfig, usdcForFiat } from "../../lib/pricing";
-import { STATIC_STALE_MS, loadMerchantProfile, saveMerchantProfile } from "../../lib/cache";
-import { loadCountry, fmtFiat, COUNTRIES, getCountry } from "../../lib/countries";
-import { loadPendingOrder, savePendingOrder, clearPendingOrder } from "../../lib/p2p";
-import { fetchOrder, receiptToken } from "../../lib/history";
-import type { PendingOrder } from "../../lib/p2p";
+import { fetchOnchainPrice, quoteFromFiat, PriceNotConfiguredError } from "../../lib/price";
+import { isPaymentPartnerAvailable } from "../../lib/p2p";
+import { loadCountry, fmtFiat, COUNTRIES } from "../../lib/countries";
 import { useT } from "../../lib/i18n";
 import dynamic from "next/dynamic";
 
@@ -27,23 +23,18 @@ const CheckoutWidget = dynamic(
 
 // Quick-amount presets per country (local fiat).
 const QUICK = { INR: [10, 20, 50], BRL: [5, 10, 20], ARS: [500, 1000, 2000] };
-// Quick-amount presets when charging directly in USDC.
-const QUICK_USDC = [1, 5, 10];
 
 // Format the RAW typed amount for display: group the integer part with the
 // country's locale but keep the decimal part EXACTLY as typed (so "10.", "10.1",
 // "10.10" all render faithfully while the merchant is entering them). Passing the
 // string through a number formatter would round/strip the in-progress decimal.
-function fmtTyped(raw: string, _country?: any): string {
+function fmtTyped(raw: string, country: any): string {
   if (!raw) return "0";
   const [intPart, decPart] = raw.split(".");
-  // Group the integer part with a COMMA and keep "." as the decimal separator —
-  // ALWAYS, regardless of locale. The keypad's decimal key inserts a ".", but
-  // pt-BR / es-AR use "." as their THOUSANDS separator, so a locale formatter
-  // turns "1000" into "1.000" (reads as a decimal) and "1000.50" into the
-  // ambiguous "1.000.50". A fixed comma-group / dot-decimal keeps the amount
-  // unmistakable and consistent with what the merchant typed.
-  const grouped = (intPart || "0").replace(/^0+(?=\d)/, "").replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+  let grouped = "0";
+  try {
+    grouped = (Number(intPart) || 0).toLocaleString(country?.locale || undefined);
+  } catch { grouped = intPart || "0"; }
   return decPart !== undefined ? `${grouped}.${decPart}` : grouped;
 }
 
@@ -78,25 +69,30 @@ export default function PosQr() {
   const [pickOpen, setPickOpen] = useState(false);
   const [amt, setAmt] = useState("");        // local fiat the merchant types
   const [lastAmt, setLastAmt] = useState(""); // for "repeat"
-  const [inputMode, setInputMode] = useState<"fiat" | "usdc">("fiat"); // what `amt` is denominated in
-  const [rate, setRate] = useState(null);           // p2p rate (on-chain price via rates.ts); used until priceCfg loads
-  const [priceCfg, setPriceCfg] = useState(null);   // live on-chain price for `country` — the REAL charge price
+  // ON-CHAIN price = the SINGLE source of truth. `price` holds the Diamond's live
+  // getPriceConfig().buyPrice (+ small-order fee) — the EXACT rate the checkout
+  // widget settles against, so the Accept figure and the Order Summary agree.
+  // (The old off-chain lib/rates.ts estimate is gone from the USDC path — it was
+  // the whole reason the two screens disagreed; see ISSUE-price-mismatch.md.)
+  const [price, setPrice] = useState(null);
+  const [priceErr, setPriceErr] = useState("");
   const [error, setError] = useState("");
   const [liveWidget, setLiveWidget] = useState(null);
   const [done, setDone] = useState(null);
   const [payError, setPayError] = useState("");
-  const [busy, setBusy] = useState(false); // pricing the sale (reading on-chain buyPrice)
-  const [imgBusy, setImgBusy] = useState(false);
-  const captureRef = useRef<HTMLDivElement>(null);
-  // A payment session that was started but not finished (widget closed / left)
-  // BEFORE the order landed on-chain. Persisted so the merchant can RESUME it
-  // instead of losing the sale, and can CANCEL a stuck one. Cleared on
-  // complete/cancel. (Bug: closing the p2p dialog used to orphan the session
-  // forever.)
+  // Pre-flight: when the merchant taps Accept we first confirm an LP is
+  // assignable for this currency+amount (the exact on-chain check the widget's
+  // router runs) BEFORE opening checkout — so placement never fails with "no
+  // payment partner". `connecting` holds the pending {usdcAmount, quantity,
+  // fiat, usdc} while we poll; the widget only mounts once a partner is found.
+  const [connecting, setConnecting] = useState<any>(null);
+  // A payment session that was started but not finished (widget closed / left).
+  // Persisted so the merchant can RESUME it instead of losing the sale, and can
+  // CANCEL a stuck one. Cleared on complete/cancel. (Bug: closing the p2p dialog
+  // used to orphan the session forever.)
   const [pendingSession, setPendingSession] = useState(null);
   const SESSION_KEY = "payqr.pendingSession";
   const SESSION_TTL_MS = 15 * 60 * 1000; // 15 min — a stale session auto-expires
-  const [pending, setPending] = useState<PendingOrder | null>(null); // order placed on-chain but never finished
 
   // Default the sale currency to the merchant's registered country.
   useEffect(() => { setCountry(loadCountry()); }, []);
@@ -127,26 +123,12 @@ export default function PosQr() {
   function resumeSession() {
     if (!pendingSession) return;
     setPayError(""); setDone(null);
-    // Restore the SAME currency the session was originally sized in — `country`
-    // may have since reverted to the merchant's registered/home currency (e.g.
-    // on a remount), and mounting the widget against the wrong currency prices
-    // this session's usdcAmount using a different currency's on-chain rate.
-    const sessionCountry =
-      (pendingSession.countryId != null ? getCountry(pendingSession.countryId) : null) ||
-      COUNTRIES.find((c) => c.code === pendingSession.currency) ||
-      country;
-    setCountry(sessionCountry);
     setLiveWidget({
       usdcAmount: BigInt(pendingSession.usdcAmount),
       quantity: BigInt(pendingSession.quantity),
-      fiat: pendingSession.fiat, usdc: pendingSession.usdc, country: sessionCountry,
+      fiat: pendingSession.fiat, usdc: pendingSession.usdc,
     });
   }
-
-  // On mount, check for a payment that was placed on-chain but never finished
-  // (e.g. merchant closed the QR dialog mid-payment) so it can be resumed
-  // instead of silently lost.
-  useEffect(() => { setPending(loadPendingOrder()); }, []);
 
   // Every configured country is selectable as the accept currency. The widget
   // resolves the circle for the picked currency at order time; if the protocol
@@ -157,23 +139,17 @@ export default function PosQr() {
   // without registering, send them to set up their shop first.
   const { data: isRegistered } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "registered",
-    args: [address], query: { enabled: !!address, staleTime: STATIC_STALE_MS },
+    args: [address], query: { enabled: !!address },
   });
   useEffect(() => {
     if (isRegistered === false) router.replace("/onboarding");
   }, [isRegistered, router]);
 
-  // Shop profile (name / registered currency) is static for the session — cache it.
   const { data: info } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "getMerchantInfo",
-    args: [address], query: { enabled: !!address, staleTime: STATIC_STALE_MS },
+    args: [address], query: { enabled: !!address },
   });
-  // Persist the (non-financial) profile so the shop name paints INSTANTLY on the
-  // next visit while the fresh on-chain read confirms in the background.
-  const [cachedProfile, setCachedProfile] = useState(() => loadMerchantProfile(address));
-  useEffect(() => { setCachedProfile(loadMerchantProfile(address)); }, [address]);
-  useEffect(() => { if (address && info) saveMerchantProfile(address, info); }, [address, info]);
-  const shopLabel = info?.[1] || cachedProfile?.shopName || "";
+  const shopLabel = info?.[1] || "";
 
   const { data: daily, refetch: refetchDaily } = useReadContract({
     address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "getDailyTxInfo",
@@ -193,61 +169,40 @@ export default function PosQr() {
     query: { enabled: !!registeredCurrencyB32 },
   });
 
+  // LIVE on-chain buy price for the sale currency — the value the widget's Order
+  // Summary uses. Refetched on currency change and every 60s so the terminal
+  // stays in step with any admin re-price. On failure we surface priceErr and
+  // show a retry state; order creation is blocked until a real on-chain price
+  // loads (see generate()) — we never place an order off a guessed rate.
   useEffect(() => {
-    if (!country) return;
+    if (!country?.code) return;
     let alive = true;
-    const load = () => fetchUsdcRate(country).then((r) => alive && setRate(r));
+    const load = () =>
+      fetchOnchainPrice(country.code)
+        .then((p) => { if (alive) { setPrice(p); setPriceErr(""); } })
+        .catch((e) => {
+          if (!alive) return;
+          setPrice(null);
+          // Distinguish "protocol hasn't priced this currency yet" (permanent,
+          // no point retrying) from a transient read failure (keep retrying).
+          setPriceErr(
+            e instanceof PriceNotConfiguredError
+              ? `${country.name || country.code} isn't available for payments yet.`
+              : "Couldn't load the live price. Retrying…"
+          );
+        });
     load();
     const t = setInterval(load, 60_000);
     return () => { alive = false; clearInterval(t); };
-  }, [country]);
-
-  // Load the LIVE on-chain price for the selected currency — this is the rate
-  // the checkout ACTUALLY charges at (getPriceConfig buyPrice + small-order fee).
-  // rates.ts now sources the SAME on-chain price, so the estimate and this only
-  // differ before it loads. We show the estimate off THIS so the "≈ X USDC" the
-  // merchant sees before pressing Accept matches the checkout total exactly.
-  useEffect(() => {
-    if (!country) { setPriceCfg(null); return; }
-    let alive = true;
-    setPriceCfg(null); // clear stale price while the new currency's loads
-    fetchPriceConfig(country.code)
-      .then((cfg) => { if (alive) setPriceCfg(cfg ? { code: country.code, ...cfg } : { code: country.code, missing: true }); })
-      .catch(() => { if (alive) setPriceCfg({ code: country.code, missing: true }); });
-    return () => { alive = false; };
-  }, [country]);
-
-  // The on-chain buyPrice as a plain number of fiat-per-USDC, when it's for the
-  // CURRENT currency and usable. This is what both the estimate and generate()
-  // price against, so they always agree.
-  const onchainRate =
-    priceCfg && !priceCfg.missing && priceCfg.code === country?.code && priceCfg.buyPrice > 0n
-      ? Number(priceCfg.buyPrice) / 1e6
-      : null;
-  // Effective fiat-per-USDC for the pre-submit estimate: prefer the freshly-read
-  // on-chain price (what checkout charges); fall back to `rate` (also the p2p
-  // on-chain price, via rates.ts) only until this dedicated read loads.
-  const estRate = onchainRate ?? (rate ? rate.rate : null);
+  }, [country?.code, country?.name]);
 
   const amtNum = Number(amt) || 0;
-  // In USDC mode the typed number IS the USDC amount. In fiat mode the estimate
-  // must match what generate()/checkout will actually charge:
-  //  • With the on-chain price loaded, run the SAME usdcForFiat() inversion the
-  //    order is sized with (it accounts for the small-order fixed fee), so the
-  //    "≈ X USDC" equals the checkout amount to the cent.
-  //  • Before that loads / for an unpriced currency, fall back to a plain
-  //    market-rate division.
-  const usdcEquiv =
-    inputMode === "usdc"
-      ? amtNum
-      : amtNum > 0
-        ? onchainRate && priceCfg && !priceCfg.missing
-          ? Number(usdcForFiat(amtNum, priceCfg)) / 1e6
-          : estRate
-            ? amtNum / estRate
-            : 0
-        : 0;
-  const fiatEquiv = inputMode === "usdc" ? (estRate && amtNum > 0 ? amtNum * estRate : 0) : amtNum;
+  // The quote comes from the ON-CHAIN buy price (price) — NOT the indicative
+  // market rate. This is what makes the Accept figure match the Order Summary.
+  // Until the on-chain price resolves, `quote` is null and the UI shows a
+  // "fetching price" state (it never shows an off-chain USDC number that the
+  // next screen would contradict).
+  const quote = price && amtNum > 0 ? quoteFromFiat(amtNum, price) : null;
   // Per-tx cap keys off the merchant's REGISTERED currency (what the contract
   // enforces in validateOrder), NOT the currency picked in the terminal — else
   // an INR merchant (50 cap) charging in BRL would be shown a 100 cap and the
@@ -259,7 +214,9 @@ export default function PosQr() {
     liveCapRaw != null
       ? Number(liveCapRaw) / 1e6
       : perTxCapUsdc(registeredCode || country?.code || "INR");
-  const overCap = usdcEquiv > capUsdc;
+  // The on-chain per-tx cap is enforced against the ORDER amount (usdcAmount),
+  // not the fee-adjusted credit — mirror that so the warning matches the revert.
+  const overCap = quote ? quote.usdc > capUsdc : false;
 
   function press(k) {
     setError("");
@@ -277,129 +234,90 @@ export default function PosQr() {
     });
   }
 
-  async function generate() {
+  function generate() {
     setError("");
-    if (!estRate) return;
-    if (amtNum <= 0) return setError(inputMode === "usdc" ? "Enter the amount in USDC." : `Enter the amount in ${country.code}.`);
+    // Order creation REQUIRES the live on-chain price — never place an order off
+    // an indicative rate, or the customer's Order Summary would disagree with
+    // what the merchant just accepted.
+    if (!price || !quote) {
+      return setError(priceErr || "Live price is still loading — one moment.");
+    }
+    if (amtNum <= 0) return setError(`Enter the amount in ${country.code}.`);
     if (overCap) {
       return setError(
-        `Max ${capUsdc} USDC per sale (≈ ${fmtFiat(country, capUsdc * estRate)} now).`
+        `Max ${capUsdc} USDC per sale (≈ ${fmtFiat(country, capUsdc * price.rate)} now).`
       );
     }
-
-    // Snapshot the charge currency NOW so everything downstream (the priced
-    // usdcAmount, the <CheckoutWidget currencies=…> prop, the saved session)
-    // agrees on THIS currency even if `country` changes before they run.
-    const chargeCountry = country;
-
-    setBusy(true);
-    let usdcTarget: bigint;
-    if (inputMode === "usdc") {
-      // The merchant typed the USDC amount directly — charge exactly that, no
-      // fiat-quote inversion needed.
-      usdcTarget = BigInt(Math.round(amtNum * 1e6));
-      setBusy(false);
-    } else {
-      // SIZE THE USDC SO THE CUSTOMER PAYS EXACTLY WHAT THE MERCHANT QUOTED,
-      // against the SAME on-chain buyPrice both the estimate above (estRate) and
-      // the checkout widget use. Re-read fresh here (the cached `priceCfg` is for
-      // display; this guarantees the order is sized against the latest on-chain
-      // value at submit time). Falls back to the estimate math if unpriceable.
-      try {
-        const cfg = await fetchPriceConfig(chargeCountry.code);
-        usdcTarget = cfg ? usdcForFiat(amtNum, cfg) : BigInt(Math.round(usdcEquiv * 1e6));
-      } catch {
-        usdcTarget = BigInt(Math.round(usdcEquiv * 1e6));
-      } finally {
-        setBusy(false);
-      }
-    }
-
-    // Our integrator prices in whole USDC cents (product-2 units = 0.01 USDC),
-    // so quantity must be an integer number of cents and usdcAmount is derived
-    // from it (× 10_000 6-dec units) — keeping the widget's displayed amount
-    // exactly equal to the on-chain order total (quantity × unit price).
-    // usdcForFiat() already snaps to the cent that lands closest to the quoted
-    // fiat total (picking whichever neighbour minimizes the drift, not just
-    // rounding the pre-fee amount) — this is a no-op for that path, and a
-    // safety-net round for the USDC-direct-entry / no-price-config fallbacks.
-    const quantity = (usdcTarget + 5_000n) / 10_000n; // round to nearest cent
+    // usdcAmount / quantity come straight from the on-chain quote (fiat inverted
+    // through the Diamond's buyPrice and quantized to the 0.01-USDC unit). This
+    // is the SAME number the widget prices its Order Summary from → no mismatch.
+    const { usdcAmount, quantity } = quote;
     if (quantity === 0n) return setError("Amount too small.");
-    const usdcAmount = quantity * 10_000n;
-    const usdc = Number(usdcAmount) / 1e6;
-    const fiatCharged = inputMode === "usdc" ? usdc * (estRate ?? 0) : amtNum;
     setLastAmt(amt);
-    setLiveWidget({ usdcAmount, quantity, fiat: fiatCharged, usdc, country: chargeCountry });
-    // Persist so the session survives a closed dialog / refresh and can be resumed.
-    saveSession({
-      usdcAmount: usdcAmount.toString(), quantity: quantity.toString(),
-      fiat: fiatCharged, usdc, currency: chargeCountry.code, countryId: chargeCountry.id,
+    // `usdc` = what the merchant keeps (the full order amount on BUY — the fee is
+    // the customer's) so the receipt/resume shows the right figure.
+    // Enter the PRE-FLIGHT phase instead of opening checkout directly: the effect
+    // below confirms an LP is assignable (the same on-chain check the widget's
+    // router runs) and only THEN mounts the widget — so placement can't fail with
+    // "no payment partner". We carry the fiat's 6-dec value for the partner check.
+    setPayError("");
+    setConnecting({
+      usdcAmount, quantity, fiat: amtNum, usdc: quote.credited,
+      fiat6: BigInt(Math.round(amtNum * 1e6)), code: country.code,
     });
   }
 
-  // Reopen the checkout modal against a previously-placed order (the merchant
-  // closed the dialog before it finished) instead of starting a fresh sale.
-  function resumePending() {
-    if (!pending) return;
-    setError("");
-    // Same rationale as resumeSession(): restore the currency this order was
-    // actually placed in, not whatever `country` currently is.
-    const pendingCountry = getCountry(pending.countryId) || country;
-    setCountry(pendingCountry);
-    setLiveWidget({
-      resumeOrderId: pending.orderId,
-      usdcAmount: BigInt(Math.round(pending.usdc * 1e6)),
-      quantity: 0n, fiat: pending.fiat, usdc: pending.usdc, country: pendingCountry,
-    });
-  }
+  // Pre-flight poller: while `connecting`, repeatedly ask the chain whether a
+  // payment partner (LP) is assignable for this currency+amount+buyer. The moment
+  // one is, we promote to the live widget (and persist a resumable session). If
+  // none appears, we stay in the calm "connecting" state — no error screen, no
+  // blind retries, and the merchant can cancel. This turns the transient
+  // testnet-LP gap into a short wait instead of a failed checkout.
+  useEffect(() => {
+    if (!connecting || !address) return;
+    let alive = true;
+    const open = () => {
+      setLiveWidget({
+        usdcAmount: connecting.usdcAmount, quantity: connecting.quantity,
+        fiat: connecting.fiat, usdc: connecting.usdc,
+      });
+      saveSession({
+        usdcAmount: connecting.usdcAmount.toString(),
+        quantity: connecting.quantity.toString(),
+        fiat: connecting.fiat, usdc: connecting.usdc, currency: connecting.code,
+      });
+      setConnecting(null);
+    };
+    const check = async () => {
+      const ok = await isPaymentPartnerAvailable(
+        connecting.code, address, connecting.usdcAmount, connecting.fiat6,
+      );
+      if (!alive) return;
+      if (ok) { open(); return; }
+      // Not yet — poll again shortly. Kept snappy (1.5s) since the gap is brief.
+      timer = setTimeout(check, 1500);
+    };
+    let timer: any = setTimeout(check, 0);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [connecting, address]);
 
-  function discardPending() {
-    clearPendingOrder();
-    setPending(null);
-  }
-
-  // Public, no-auth-but-tokened receipt link the CUSTOMER opens to verify
-  // their payment. Only holders of this exact link (with its token) can view
-  // the receipt — see receiptToken() in lib/history.ts.
+  // Public, no-auth receipt link the CUSTOMER opens to verify their payment.
   function receiptUrl() {
-    if (typeof window === "undefined" || !done || !done.token) return "";
+    if (typeof window === "undefined" || !done) return "";
     const q = new URLSearchParams({
       shop: shopLabel || "My Shop",
-      fiat: fmtFiat(done.country || country, done.fiat),
-      token: done.token,
+      fiat: fmtFiat(country, done.fiat),
     });
     return `${window.location.origin}/receipt/${done.orderId}?${q.toString()}`;
   }
 
-  // Render the confirmation card to a PNG and hand it to the OS share sheet
-  // (or download it, if sharing files isn't supported) — so the merchant can
-  // forward proof of payment as an image instead of just a link.
-  async function shareReceipt() {
-    if (!captureRef.current || imgBusy || !done) return;
-    setImgBusy(true);
-    try {
-      const { default: html2canvas } = await import("html2canvas");
-      const canvas = await html2canvas(captureRef.current, {
-        backgroundColor: getComputedStyle(captureRef.current).backgroundColor || "#ffffff",
-        scale: Math.min(window.devicePixelRatio || 2, 3),
-      });
-      const blob: Blob | null = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
-      if (!blob) return;
-      const file = new File([blob], `payqr-receipt-${done.orderId}.png`, { type: "image/png" });
-      if (navigator.canShare?.({ files: [file] })) {
-        await navigator.share({ files: [file], title: "PayQR receipt" });
-      } else {
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = url; a.download = file.name;
-        document.body.appendChild(a); a.click(); a.remove();
-        URL.revokeObjectURL(url);
-      }
-    } catch {
-      // Best-effort — leave the merchant with the on-screen confirmation if it fails.
-    } finally {
-      setImgBusy(false);
-    }
+  function shareReceipt() {
+    const url = receiptUrl();
+    const text =
+      `PayQR receipt — ${shopLabel || "My Shop"}\n` +
+      `${fmtFiat(country, done.fiat)} received. Verify your payment:`;
+    if (navigator.share) navigator.share({ title: "PayQR receipt", text, url }).catch(() => {});
+    else navigator.clipboard?.writeText(`${text}\n${url}`);
   }
 
   if (!country) return <><Nav back /><div className="screen"><p className="muted" style={{ textAlign: "center" }}>Loading…</p></div></>;
@@ -414,93 +332,75 @@ export default function PosQr() {
         {liveWidget && (
           <>
             <CheckoutWidget
-              orderId={liveWidget.resumeOrderId}
               usdcAmount={liveWidget.usdcAmount}
               quantity={liveWidget.quantity}
               productName={shopLabel || "PayQR sale"}
               currencies={[{
-                symbol: liveWidget.country.code, flag: liveWidget.country.flag,
-                paymentMethod: liveWidget.country.fiat, symbolNative: liveWidget.country.symbol,
+                symbol: country.code, flag: country.flag,
+                paymentMethod: country.fiat, symbolNative: country.symbol,
               }]}
-              onPlaced={(orderId) => {
-                savePendingOrder({
-                  orderId: String(orderId), fiat: liveWidget.fiat, usdc: liveWidget.usdc,
-                  countryId: liveWidget.country.id, shopLabel, savedAt: Date.now(),
-                });
-              }}
               onComplete={(orderId) => {
                 paymentFeedback();
-                clearPendingOrder(); setPending(null);
-                const id = String(orderId);
-                setDone({ orderId: id, usdc: liveWidget.usdc, fiat: liveWidget.fiat, token: "", country: liveWidget.country });
+                setDone({ orderId: String(orderId), usdc: liveWidget.usdc, fiat: liveWidget.fiat });
                 setLiveWidget(null); setAmt(""); clearSession(); refetchDaily();
-                // The receipt link's access token needs this order's real tx hash.
-                // The subgraph indexes it moments after settlement, so poll briefly
-                // rather than leaving the share link without a token.
-                (async () => {
-                  for (let i = 0; i < 8; i++) {
-                    const o: any = await fetchOrder(id);
-                    if (o?.txHash) {
-                      setDone((d: any) => (d && d.orderId === id ? { ...d, token: receiptToken(id, o.txHash) } : d));
-                      return;
-                    }
-                    await new Promise((r) => setTimeout(r, 1500));
-                  }
-                })();
               }}
-              onCancel={() => {
-                clearPendingOrder(); setPending(null);
-                setLiveWidget(null); clearSession(); refetchDaily();
-              }}
+              onCancel={() => { setLiveWidget(null); clearSession(); refetchDaily(); }}
+              // Closing the dialog does NOT discard the session — it stays so the
+              // merchant can resume it from the "pending payment" banner below.
               onClose={() => setLiveWidget(null)}
               onError={(m) => {
-                clearPendingOrder(); setPending(null);
+                // Safety net: if the LP dropped in the split second between our
+                // pre-flight OK and the tx landing, the widget reports a routing/
+                // "no partner" error. Instead of a dead-end screen, fall back into
+                // the connecting-wait so we re-poll and reopen once it's back.
+                const routing = /no payment partner|no circleId|no eligible|ROUTING_NO_MERCHANTS|placeOrder\.prepare/i.test(m || "");
+                if (routing) {
+                  setLiveWidget(null);
+                  setConnecting({
+                    usdcAmount: liveWidget.usdcAmount, quantity: liveWidget.quantity,
+                    fiat: liveWidget.fiat, usdc: liveWidget.usdc,
+                    fiat6: BigInt(Math.round(liveWidget.fiat * 1e6)), code: country.code,
+                  });
+                  return;
+                }
                 setPayError(m); setLiveWidget(null);
               }}
             />
           </>
         )}
 
-        {/* Resume / cancel an unfinished payment that hasn't reached the chain
-            yet (dialog was closed or app left before the order was placed).
+        {/* Pre-flight: confirming a payment partner (LP) is online before we open
+            checkout. On testnet the single LP flickers; rather than open the
+            widget and let placement fail, we hold here and poll until a partner
+            is assignable, then the effect promotes us to the live widget. The
+            merchant can cancel to go back to the keypad. */}
+        {connecting && !liveWidget && !done && (
+          <div className="panel" style={{ textAlign: "center" }}>
+            <h2>Connecting to a payment partner…</h2>
+            <p className="muted" style={{ margin: "8px 0 4px" }}>
+              Getting {fmtFiat(country, connecting.fiat)} ready — this usually takes a moment.
+              Keep this screen open; the QR appears automatically.
+            </p>
+            <div className="spinner" style={{ margin: "14px auto" }} aria-hidden="true" />
+            <button className="btn ghost" style={{ width: "100%" }}
+              onClick={() => setConnecting(null)}>
+              Cancel
+            </button>
+          </div>
+        )}
+
+        {/* Resume / cancel an unfinished payment (dialog was closed or app left).
             Fixes the orphaned-session bug + gives a way out of a stuck order. */}
-        {pendingSession && !pending && !liveWidget && !done && (
+        {pendingSession && !liveWidget && !done && !connecting && (
           <div className="panel" style={{ textAlign: "center" }}>
             <h2>Payment in progress</h2>
             <p className="muted" style={{ margin: "6px 0 12px" }}>
-              {/* Format with the currency the session was STARTED in, not the
-                  current `country` (which may have reverted to the merchant's
-                  home currency on a remount) — else a BRL session shows the ₹
-                  symbol / INR grouping. Mirrors resumeSession()'s resolution. */}
-              You have an unfinished sale of{" "}
-              {fmtFiat(
-                (pendingSession.countryId != null ? getCountry(pendingSession.countryId) : null) ||
-                  COUNTRIES.find((c) => c.code === pendingSession.currency) ||
-                  country,
-                pendingSession.fiat
-              )}{" "}
-              {pendingSession.currency}.
+              You have an unfinished sale of {fmtFiat(country, pendingSession.fiat)} {pendingSession.currency}.
               Resume to show the QR again, or cancel to start over.
             </p>
             <div style={{ display: "flex", gap: 8 }}>
               <button className="btn" style={{ flex: 1 }} onClick={resumeSession}>Resume payment</button>
               <button className="btn ghost" style={{ flex: 1 }} onClick={clearSession}>Cancel</button>
-            </div>
-          </div>
-        )}
-
-        {/* A payment was placed on-chain but the dialog closed before it
-            finished — offer to pick it back up instead of losing it. */}
-        {pending && !liveWidget && !done && !payError && (
-          <div className="panel" style={{ textAlign: "center" }}>
-            <h2>Unfinished payment</h2>
-            <p className="muted" style={{ margin: "8px 0 4px" }}>
-              A sale for {fmtFiat(getCountry(pending.countryId), pending.fiat)} is still
-              in progress (order #{pending.orderId}).
-            </p>
-            <div className="recv-actions" style={{ marginTop: 14 }}>
-              <button className="btn ghost" onClick={discardPending}>Discard</button>
-              <button className="btn" onClick={resumePending}>Resume</button>
             </div>
           </div>
         )}
@@ -524,40 +424,32 @@ export default function PosQr() {
         {/* You received USDC — confirmation */}
         {done && (
           <div className="received">
-            <div ref={captureRef}>
-              <div className="tick-wrap"><Icon.Check /></div>
-              <div className="recv-h">{t("qr.received")}<br />${done.usdc.toFixed(2)} USDC</div>
-              <p className="muted recv-sub">
-                Settled on-chain · paid by customer ({fmtFiat(done.country || country, done.fiat)}).
-                Withdraw to your bank or keep as USDC.
-              </p>
-              <div className="proofcard">
-                <div className="prow"><span className="k">Order</span><span className="v">#{done.orderId}</span></div>
-                <div className="prow"><span className="k">Received</span><span className="v">{done.usdc.toFixed(2)} USDC</span></div>
-                <div className="prow">
-                  <span className="k">Proof</span>
-                  <a className="v link" target="_blank" rel="noopener noreferrer"
-                     href={`${SCAN}/address/${INTEGRATOR}`}>Basescan ↗</a>
-                </div>
+            <div className="tick-wrap"><Icon.Check /></div>
+            <div className="recv-h">{t("qr.received")}<br />${done.usdc.toFixed(2)} USDC</div>
+            <p className="muted recv-sub">
+              Settled on-chain · paid by customer ({fmtFiat(country, done.fiat)}).
+              Withdraw to your bank or keep as USDC.
+            </p>
+            <div className="proofcard">
+              <div className="prow"><span className="k">Order</span><span className="v">#{done.orderId}</span></div>
+              <div className="prow"><span className="k">Received</span><span className="v">{done.usdc.toFixed(2)} USDC</span></div>
+              <div className="prow">
+                <span className="k">Proof</span>
+                <a className="v link" target="_blank" rel="noopener noreferrer"
+                   href={`${SCAN}/address/${INTEGRATOR}`}>Basescan ↗</a>
               </div>
             </div>
-            {done.token ? (
-              <a className="recv-receipt-link" href={receiptUrl()} target="_blank" rel="noopener noreferrer">
-                <Icon.Receipt width="15" height="15" /> {t("qr.showReceipt")}
-              </a>
-            ) : (
-              <p className="muted tiny" style={{ margin: "6px 0" }}>Preparing receipt link…</p>
-            )}
+            <a className="recv-receipt-link" href={receiptUrl()} target="_blank" rel="noopener noreferrer">
+              <Icon.Receipt width="15" height="15" /> {t("qr.showReceipt")}
+            </a>
             <div className="recv-actions">
-              <button className="btn ghost" onClick={shareReceipt} disabled={imgBusy}>
-                <Icon.Share /> {imgBusy ? "Preparing image…" : t("qr.sendReceipt")}
-              </button>
+              <button className="btn ghost" onClick={shareReceipt}><Icon.Share /> {t("qr.sendReceipt")}</button>
               <button className="btn" onClick={() => setDone(null)}><Icon.Plus /> {t("qr.next")}</button>
             </div>
           </div>
         )}
 
-        {limitReached && !liveWidget && !done && !payError && !pendingSession && !pending && (
+        {limitReached && !liveWidget && !done && !payError && !connecting && (
           <div className="panel">
             <h2>Daily limit reached ({String(used)}/{String(limit)})</h2>
             <p className="muted">All transactions used for today. Resets at midnight UTC.</p>
@@ -565,78 +457,66 @@ export default function PosQr() {
         )}
 
         {/* Number-pad terminal */}
-        {!limitReached && !liveWidget && !done && !payError && !pendingSession && !pending && (
+        {!limitReached && !liveWidget && !done && !payError && !pendingSession && !connecting && (
           <div className="terminal">
             {/* charge-currency picker — only shows currencies the protocol can
                 settle (live circles). Lets a merchant accept in any supported
                 currency, e.g. when travelling. Default = registered country. */}
-            <div className="cur-pick-row">
-              {/* Locked while a sale is being priced (`busy`): the on-chain price
-                  read is keyed off `country.code` at the moment it started, so
-                  switching currency mid-flight would size the USDC amount for
-                  one currency while pricing it against another's rate. */}
-              {payOpts.length > 1 && (
-                <div className="cur-pick">
-                  <button className={`cur-pick-btn ${pickOpen ? "on" : ""}`} disabled={busy}
-                    onClick={() => setPickOpen((o) => !o)}>
-                    <span className="cur-pick-label">{t("qr.chargeIn")}</span>
-                    <img className="cur-flag" src={`https://flagcdn.com/w40/${({india:"in",brazil:"br",argentina:"ar"})[country.id] || "un"}.png`} alt="" />
-                    <b>{country.code}</b><span className="cur-car">▾</span>
-                  </button>
-                  {pickOpen && (
-                    <div className="cur-pick-pop">
-                      {payOpts.map((c) => (
-                        <button key={c.id} className={`cur-pick-item ${c.id === country.id ? "sel" : ""}`}
-                          onClick={() => { setCountry(c); setAmt(""); setError(""); setPickOpen(false); }}>
-                          <img className="cur-flag" src={`https://flagcdn.com/w40/${({india:"in",brazil:"br",argentina:"ar"})[c.id] || "un"}.png`} alt="" />
-                          <span className="cur-pick-txt">{c.name}<small>{c.fiat} · {c.symbol} {c.code}</small></span>
-                          {c.id === country.id && <span className="cur-chk">✓</span>}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-              )}
-              {/* fiat / USDC input-mode toggle — switches what the keypad + quick
-                  chips are denominated in. */}
-              <div className="mode-toggle">
-                <button className={`mode-toggle-opt ${inputMode === "fiat" ? "sel" : ""}`} disabled={busy}
-                  onClick={() => { setInputMode("fiat"); setAmt(""); setError(""); }}>
-                  {country.code}
+            {payOpts.length > 1 && (
+              <div className="cur-pick">
+                <button className={`cur-pick-btn ${pickOpen ? "on" : ""}`}
+                  onClick={() => setPickOpen((o) => !o)}>
+                  <span className="cur-pick-label">{t("qr.chargeIn")}</span>
+                  <img className="cur-flag" src={`https://flagcdn.com/w40/${({india:"in",brazil:"br",argentina:"ar"})[country.id] || "un"}.png`} alt="" />
+                  <b>{country.code}</b><span className="cur-car">▾</span>
                 </button>
-                <button className={`mode-toggle-opt ${inputMode === "usdc" ? "sel" : ""}`} disabled={busy}
-                  onClick={() => { setInputMode("usdc"); setAmt(""); setError(""); }}>
-                  USDC
-                </button>
+                {pickOpen && (
+                  <div className="cur-pick-pop">
+                    {payOpts.map((c) => (
+                      <button key={c.id} className={`cur-pick-item ${c.id === country.id ? "sel" : ""}`}
+                        onClick={() => { setCountry(c); setAmt(""); setError(""); setPickOpen(false); }}>
+                        <img className="cur-flag" src={`https://flagcdn.com/w40/${({india:"in",brazil:"br",argentina:"ar"})[c.id] || "un"}.png`} alt="" />
+                        <span className="cur-pick-txt">{c.name}<small>{c.fiat} · {c.symbol} {c.code}</small></span>
+                        {c.id === country.id && <span className="cur-chk">✓</span>}
+                      </button>
+                    ))}
+                  </div>
+                )}
               </div>
-            </div>
+            )}
             <div className="t-amount">
               <div className="t-shop">{shopLabel || t("qr.newSale")}</div>
               {/* Show the RAW typed string (preserves "10." and decimals while
                   typing) with grouping on the integer part only — passing `amt`
                   through fmtFiat would round away the decimal being entered. */}
-              <div className="t-value">
-                {inputMode === "usdc" ? `${fmtTyped(amt, country)} USDC` : `${country.symbol}${fmtTyped(amt, country)}`}
-              </div>
+              <div className="t-value">{country.symbol}{fmtTyped(amt, country)}</div>
               <div className="t-sub">
-                {estRate
-                  ? amtNum > 0
-                    ? inputMode === "usdc"
-                      ? `≈ ${fmtFiat(country, fiatEquiv)} ${country.code}`
-                      : `≈ ${usdcEquiv.toFixed(2)} USDC ${t("qr.youKeep")}`
-                    : t("qr.enterAmount")
-                  : t("qr.fetchingRate")}
+                {amtNum <= 0
+                  ? t("qr.enterAmount")
+                  : quote
+                    ? `≈ ${quote.usdc.toFixed(2)} USDC ${t("qr.youKeep")}`
+                    : priceErr
+                      ? priceErr
+                      : t("qr.fetchingRate")}
               </div>
-              {overCap && estRate && (
-                <div className="t-warn">Max {fmtFiat(country, capUsdc * estRate)} per sale</div>
+              {/* On BUY the small-order fee is added to the CUSTOMER's fiat (the
+                  merchant still keeps the full USDC). Show the customer's all-in
+                  cost so there are no surprises on the next screen. */}
+              {quote && quote.fee > 0 && (
+                <div className="t-sub" style={{ opacity: 0.8, fontSize: "0.85em" }}>
+                  Customer pays ≈ {fmtFiat(country, quote.total)} (incl. fee)
+                </div>
+              )}
+              {overCap && price && (
+                <div className="t-warn">Max {fmtFiat(country, capUsdc * price.rate)} per sale</div>
               )}
             </div>
 
             {/* quick amounts + repeat */}
             <div className="quick-amts">
-              {(inputMode === "usdc" ? QUICK_USDC : quick).map((q) => (
+              {quick.map((q) => (
                 <button key={q} className="qa-chip" onClick={() => { setAmt(String(q)); setError(""); }}>
-                  {inputMode === "usdc" ? `${q} USDC` : `${country.symbol}${q}`}
+                  {country.symbol}{q}
                 </button>
               ))}
               <button className="qa-chip repeat" disabled={!lastAmt}
@@ -655,8 +535,8 @@ export default function PosQr() {
 
             <button className="btn t-charge"
               style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8 }}
-              disabled={!ready || !estRate || amtNum <= 0 || overCap || busy} onClick={generate}>
-              <Icon.Qr /> {busy ? t("qr.fetchingRate") : amtNum > 0 ? `${t("common.acceptPayment")} · ${inputMode === "usdc" ? `${fmtTyped(amt, country)} USDC` : `${country.symbol}${fmtTyped(amt, country)}`}` : t("common.acceptPayment")}
+              disabled={!ready || !quote || amtNum <= 0 || overCap} onClick={generate}>
+              <Icon.Qr /> {amtNum > 0 ? `${t("common.acceptPayment")} · ${country.symbol}${fmtTyped(amt, country)}` : t("common.acceptPayment")}
             </button>
             {error && <p className="error" style={{ textAlign: "center" }}>{error}</p>}
             <div className="t-foot">{String(used)} / {String(limit)} sales today</div>

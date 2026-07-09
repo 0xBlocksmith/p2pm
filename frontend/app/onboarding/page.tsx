@@ -5,21 +5,25 @@ import { useRouter } from "next/navigation";
 import { usePublicClient } from "wagmi";
 import { encodeFunctionData } from "viem";
 import { useMerchant } from "../../components/useMerchant";
+import { useRelayIdentity } from "../../components/useRelayIdentity";
 import { Logo } from "../../components/Icons";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI } from "../../lib/contract";
+import { encryptPayout } from "../../lib/payoutCrypto";
 import { loadCountry, prefsSet } from "../../lib/countries";
 
 /**
  * Registration only (country + language already chosen on /select). Shop name +
  * the country's payout field → registered ON-CHAIN via registerMerchant
- * (payoutId, shopName). The payout id is a generic string, so UPI / PIX / CBU
- * all fit today. Gas sponsored — no wallet popups.
+ * (encPayoutId, shopName). The payout handle is encrypted CLIENT-SIDE
+ * (encryptPayout) to the merchant's own relay key before it ever goes on-chain —
+ * the raw UPI / PIX / CBU is never public. Gas sponsored — no wallet popups.
  */
 export default function Onboarding() {
   const router = useRouter();
   const { ready, address, isRegistered, sendTransaction, refetchRegistered } = useMerchant({
     requireRegistered: false,
   });
+  const { getIdentity } = useRelayIdentity();
   const publicClient = usePublicClient();
 
   const [country, setCountry] = useState(null);
@@ -66,12 +70,18 @@ export default function Onboarding() {
         return setError("Your gas-free wallet is still connecting. Wait a moment and try again.");
       }
 
+      // Encrypt the payout handle CLIENT-SIDE to the merchant's own relay key —
+      // the raw UPI/PIX id must never go on-chain in plaintext (it's PII). The
+      // contract stores the opaque ciphertext blob.
+      const identity = await getIdentity();
+      const encPayout = await encryptPayout(payoutId.trim(), identity);
+
       // The new contract locks the offramp currency at registration, so we pass
       // the chosen country's ISO code (e.g. "INR"/"BRL"/"ARS") as the 3rd arg.
       const data = encodeFunctionData({
         abi: INTEGRATOR_ABI,
         functionName: "registerMerchant",
-        args: [payoutId.trim(), shopName.trim(), country.code],
+        args: [encPayout, shopName.trim(), country.code],
       });
       const hash = await send({ to: CONTRACT_ADDRESS, data });
 
@@ -94,8 +104,15 @@ export default function Onboarding() {
       router.replace("/qr");
     } catch (err) {
       console.error("register failed:", err);
-      const msg = err?.shortMessage || err?.details || err?.message || "Setup failed";
-      setError(msg.includes("User rejected") ? "Cancelled." : `Setup failed: ${msg}`);
+      const raw = String(err?.shortMessage || err?.details || err?.message || "");
+      if (/User rejected|reject|denied/i.test(raw)) {
+        setError("Cancelled.");
+      } else if (/5\d\d|522|504|timed out|timeout|Unexpected token|not valid JSON|network|fetch failed/i.test(raw)) {
+        // Transient thirdweb bundler/paymaster infra error (already auto-retried).
+        setError("Network hiccup reaching the gas-free wallet service. Please tap again in a moment.");
+      } else {
+        setError(`Setup failed: ${raw || "please try again"}`);
+      }
       setBusy(false);
     }
   }

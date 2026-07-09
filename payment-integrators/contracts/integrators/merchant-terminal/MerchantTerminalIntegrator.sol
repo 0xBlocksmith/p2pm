@@ -10,6 +10,21 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 
+/// @dev Minimal interface to the segregated custody vault (see PayQRVault.sol).
+///      The integrator holds no funds — it asks the vault to move USDC via pull,
+///      and reads vault.balance() for its solvency checks.
+interface IPayQRVault {
+    function pull(address to, uint256 amount) external;
+    function balance() external view returns (uint256);
+}
+
+/// @dev Minimal view into a PRIOR integrator, read once by migrateState to copy
+///      its accounting (totalOwed) onto a fresh integrator that inherits the same
+///      vault. Lets a migration keep accounting matched to the custody it adopts.
+interface IPriorIntegrator {
+    function totalOwed() external view returns (uint256);
+}
+
 /**
  * @title MerchantTerminalIntegrator
  * @notice P2P merchant terminal: merchants accept local-currency payments from
@@ -48,6 +63,19 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     // ─── Errors ───────────────────────────────────────────────────────
     error OnlyDiamond();
     error OnlyOwner();
+    /// @dev A super-admin-only action was called by someone who isn't the super-admin.
+    error OnlySuperAdmin();
+    /// @dev The super-admin is the single unremovable root of access control — it
+    ///      can be neither removed as an owner nor demoted below FINANCE by anyone.
+    error CannotRemoveSuperAdmin();
+    /// @dev The last remaining owner can't be removed (never orphan the contract).
+    error LastOwner();
+    /// @dev The custody vault isn't set (or is zero) but a fund move was attempted.
+    error VaultNotSet();
+    /// @dev migrateState was already run once (it is a one-shot cutover primitive).
+    error AlreadyMigrated();
+    /// @dev migrateState requires a live vault link and a non-zero prior integrator.
+    error MigrateStatePreconditions();
     /// @dev Raised when the caller's role tier is below what an action requires.
     ///      Carries (required, actual) tier values so the admin panel can show
     ///      exactly which role is needed. required/actual are the Role enum uint8.
@@ -81,8 +109,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     // ─── Events ───────────────────────────────────────────────────────
     event OrderPlaced(uint256 indexed orderId, address indexed user, uint256 amount);
     event UserProxyDeployed(address indexed user, address proxy);
-    event MerchantRegistered(address indexed merchant, string payoutId, string shopName, bytes32 currency);
-    event MerchantProfileUpdated(address indexed merchant, string payoutId, string shopName);
+    // NOTE: the payout handle is intentionally NOT in these events. It is PII
+    // (a real UPI/PIX/bank id); emitting it — even encrypted — would bloat logs
+    // and, if ever plaintext, permanently leak it. The app already knows the
+    // handle it just set; indexers key off `merchant`.
+    event MerchantRegistered(address indexed merchant, string shopName, bytes32 currency);
+    event MerchantProfileUpdated(address indexed merchant, string shopName);
     event OrderCompleted(
         uint256 indexed orderId,
         address indexed merchant,
@@ -106,6 +138,17 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         (0=NONE,1=VIEWER,2=SUPPORT,3=MANAGER,4=FINANCE).
     event AdminRoleSet(address indexed admin, uint8 role);
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+    event OwnerAdded(address indexed owner);
+    event OwnerRemoved(address indexed owner);
+    /// @notice The super-admin (the single unremovable root of access control) was
+    ///         handed off from `previous` to `next`.
+    event SuperAdminTransferred(address indexed previous, address indexed next);
+    event VaultSet(address indexed vault);
+    /// @notice totalOwed was seeded from a prior integrator during a migration.
+    event MigratedState(address indexed priorIntegrator, uint256 totalOwed);
+    /// @notice USDC that was held on the integrator (vault-unset window) was
+    ///         forwarded into the vault once the link was wired.
+    event FlushedToVault(uint256 amount);
 
     // ─── Immutables ───────────────────────────────────────────────────
     address public immutable diamond;
@@ -113,10 +156,26 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         resolve which token to block from user-initiated sweep —
     ///         UserProxy.sweepERC20 calls `IUsdcSource(integrator()).usdc()`.
     IERC20 public immutable usdc;
-    /// @notice Root admin. Set to the deployer at construction; transferable via
-    ///         transferOwnership (e.g. to a team multisig). The owner manages the
-    ///         admin set. NOT immutable so control can move without a redeploy.
-    address public owner;
+    /// @notice MULTI-OWNER root admins. Each owner has FULL access (top tier —
+    ///         manages the admin set, ownership, vault pointer, everything). The
+    ///         deployer is the first owner; more can be seeded at construction and
+    ///         added/removed later. The last owner can never be removed (so the
+    ///         contract can't be orphaned). Sits ABOVE the 5-tier role system.
+    mapping(address => bool) public isOwner;
+    uint256 public ownerCount;
+    /// @notice THE SUPER-ADMIN: the single unremovable root of access control.
+    ///         It is always ALSO an owner (so it keeps full FINANCE-tier powers),
+    ///         but sits strictly above every owner: only the super-admin can add or
+    ///         remove owners and assign/revoke roles. Crucially, NO ONE can remove
+    ///         or demote the super-admin — not another owner, not itself via the
+    ///         owner path. The role only ever moves via `transferSuperAdmin`, an
+    ///         explicit self-initiated handoff. Seeded to the deployer at construction.
+    address public superAdmin;
+    /// @notice The segregated custody vault holding ALL merchant USDC. The
+    ///         integrator moves funds only via `vault.pull(...)` and reads
+    ///         `vault.balance()` for solvency. Owner-settable so a migration can
+    ///         point a fresh integrator at the same vault (funds never move).
+    address public vault;
     /// @notice Pinned at deploy. Submit this address alongside the integrator
     ///         address when filing the whitelist request — the Diamond's
     ///         `registerIntegrator(integrator, proxyImpl, source)` records it
@@ -154,7 +213,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     struct Merchant {
         address merchantAddr;
-        string payoutId;     // generic payout handle: UPI / PIX key / CBU / alias
+        // ENCRYPTED payout handle. The raw UPI / PIX / CBU / alias must NEVER be
+        // stored on-chain in plaintext (public-chain PII leak). The app encrypts
+        // the handle CLIENT-SIDE to the merchant's relay pubkey before sending it
+        // here; the contract treats it as an opaque, non-empty blob it never
+        // decodes. The LP/app decrypts off-chain when building the payout.
+        bytes encPayoutId;
         string shopName;
         bytes32 currency;    // offramp currency, e.g. bytes32("INR"|"BRL"|"ARS") — set once at registration
         uint256 totalDeposited;
@@ -183,6 +247,11 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         merchant, never sourced from the commingled pool, so the pool
     ///         can never go under-collateralized against what merchants are owed.
     uint256 public totalOwed;
+
+    /// @notice One-shot guard for migrateState — a fresh integrator adopting an
+    ///         existing vault copies the prior integrator's totalOwed exactly
+    ///         once, so accounting matches the custody it inherits. Never re-runs.
+    bool public stateMigrated;
 
     mapping(address => Merchant) public merchants;
     mapping(address => bool) public registered;
@@ -252,14 +321,22 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     }
 
     modifier onlyOwner() {
-        if (msg.sender != owner) revert OnlyOwner();
+        if (!isOwner[msg.sender]) revert OnlyOwner();
         _;
     }
 
-    /// @dev The owner's EFFECTIVE tier is FINANCE (the top admin tier), so a
-    ///      single hierarchy check covers both the owner and any assigned admin.
+    /// @dev Restricts an action to the single super-admin. Used for the root of
+    ///      access control: owner-set management (add/remove owners) and role
+    ///      assignment. Owners below the super-admin cannot perform these.
+    modifier onlySuperAdmin() {
+        if (msg.sender != superAdmin) revert OnlySuperAdmin();
+        _;
+    }
+
+    /// @dev Any owner's EFFECTIVE tier is FINANCE (the top admin tier), so a
+    ///      single hierarchy check covers both owners and any assigned admin.
     function _tier(address who) internal view returns (Role) {
-        return who == owner ? Role.FINANCE : adminRole[who];
+        return isOwner[who] ? Role.FINANCE : adminRole[who];
     }
 
     /// @dev Require caller's tier >= `min`. Roles are hierarchical, so gating an
@@ -271,9 +348,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         _;
     }
 
-    /// @notice True if `who` can perform ANY admin action (owner or any role).
+    /// @notice True if `who` can perform ANY admin action (an owner or any role).
     function isAdmin(address who) public view returns (bool) {
-        return who == owner || adminRole[who] != Role.NONE;
+        return isOwner[who] || adminRole[who] != Role.NONE;
     }
 
     /// @notice True if `who` can perform MANAGER (config) actions or higher.
@@ -295,11 +372,31 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     // ─── Constructor ──────────────────────────────────────────────────
 
-    constructor(address _diamond, address _usdc) {
+    /**
+     * @param _diamond   the p2p Diamond.
+     * @param _usdc      USDC token.
+     * @param _vault     the PayQRVault that custodies funds (must be set to this
+     *                   integrator via vault.setIntegrator after deploy). address(0)
+     *                   is allowed at construction and set later via setVault, so
+     *                   deploy order can be integrator-first or vault-first.
+     * @param _owners    additional owners (each full access). The deployer is
+     *                   always the first owner.
+     */
+    constructor(address _diamond, address _usdc, address _vault, address[] memory _owners) {
         if (_diamond == address(0) || _usdc == address(0)) revert InvalidAddress();
         diamond = _diamond;
         usdc = IERC20(_usdc);
-        owner = msg.sender;
+        vault = _vault;
+        // Seed the deployer + any extra owners (each with full access). The
+        // deployer is ALSO the super-admin — the single unremovable root that
+        // alone manages the owner set and role assignments. Hand it off later
+        // via transferSuperAdmin (e.g. to a multisig) once deployment settles.
+        _addOwner(msg.sender);
+        superAdmin = msg.sender;
+        emit SuperAdminTransferred(address(0), msg.sender);
+        for (uint256 i = 0; i < _owners.length; i++) {
+            if (_owners[i] != address(0) && !isOwner[_owners[i]]) _addOwner(_owners[i]);
+        }
         dailyLimit = DAILY_TX_LIMIT; // live limit starts at the default (25)
         // Deploy the canonical UserProxy implementation. Every per-user clone
         // is a `cloneDeterministicWithImmutableArgs` of this address, with
@@ -314,7 +411,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     // 0x494e520000…00 is unreadable, so this contract speaks plain ISO-4217
     // currency CODES ("INR", "BRL", "ARS", "MXN", "NGN", …):
     //
-    //   • `registerMerchant(payoutId, shopName, "BRL")`  ← human-readable string
+    //   • `registerMerchant(encPayoutId, shopName, "BRL")`  ← currency as a string
     //   • `getMerchantCurrency(addr)` → "BRL"            ← read it back as text
     //
     // Any country is supported as long as the p2p protocol has a circle for that
@@ -349,60 +446,61 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     /// @notice Register the calling merchant with a human-readable currency
     ///         CODE ("INR", "BRL", "ARS", …). This is the recommended entry
     ///         point — any country picks its ISO currency code and is supported
-    ///         as long as the protocol has a circle for it. The payout id is a
-    ///         generic string (UPI / PIX key / CBU / alias) — the contract never
-    ///         interprets it; the country's LP knows how to pay it out.
-    /// @param payoutId  Where local-fiat withdrawals land (UPI/PIX/CBU/…).
+    ///         as long as the protocol has a circle for it.
+    /// @param encPayoutId  The merchant's payout handle (UPI/PIX/CBU/…),
+    ///        ENCRYPTED CLIENT-SIDE to the merchant's relay pubkey. The contract
+    ///        stores it as an opaque, non-empty blob and NEVER decodes it — the
+    ///        raw handle must never be sent here in plaintext (public-chain PII).
     /// @param shopName  Display name.
     /// @param currencyCode ISO-4217-style code, e.g. "INR", "BRL". Non-empty.
     function registerMerchant(
-        string calldata payoutId,
+        bytes calldata encPayoutId,
         string calldata shopName,
         string calldata currencyCode
     ) external {
-        _register(payoutId, shopName, toCurrency(currencyCode));
+        _register(encPayoutId, shopName, toCurrency(currencyCode));
     }
 
-    /// @notice Same as above but takes the packed bytes32 directly, for callers
-    ///         that already have it (e.g. tooling). Most integrations should use
-    ///         the string overload above.
+    /// @notice Same as above but takes the packed bytes32 currency directly, for
+    ///         callers that already have it (e.g. tooling). Most integrations
+    ///         should use the string overload above.
     /// @param currency bytes32 offramp currency, e.g. bytes32("INR"). Non-zero.
     function registerMerchantRaw(
-        string calldata payoutId,
+        bytes calldata encPayoutId,
         string calldata shopName,
         bytes32 currency
     ) external {
-        _register(payoutId, shopName, currency);
+        _register(encPayoutId, shopName, currency);
     }
 
-    /// @notice Update the caller's editable profile fields — payout handle
-    ///         (UPI/PIX/CBU) and shop name. The offramp CURRENCY is intentionally
-    ///         NOT editable: it's locked at registration because funds and
-    ///         in-flight orders are denominated in it, and changing it mid-flight
-    ///         could route a settlement to the wrong circle. To change currency,
-    ///         a merchant uses a fresh wallet/registration.
-    /// @param payoutId New payout handle (non-empty).
+    /// @notice Update the caller's editable profile fields — the encrypted payout
+    ///         handle and shop name. The offramp CURRENCY is intentionally NOT
+    ///         editable: it's locked at registration because funds and in-flight
+    ///         orders are denominated in it, and changing it mid-flight could
+    ///         route a settlement to the wrong circle. To change currency, a
+    ///         merchant uses a fresh wallet/registration.
+    /// @param encPayoutId New payout handle, client-side ENCRYPTED (non-empty).
     /// @param shopName New display name.
-    function updateProfile(string calldata payoutId, string calldata shopName) external {
+    function updateProfile(bytes calldata encPayoutId, string calldata shopName) external {
         if (!registered[msg.sender]) revert NotRegistered();
-        if (bytes(payoutId).length == 0) revert InvalidAddress();
+        if (encPayoutId.length == 0) revert InvalidAddress();
         Merchant storage m = merchants[msg.sender];
         if (m.isFrozen) revert MerchantIsFrozen(); // a frozen merchant can't edit
-        m.payoutId = payoutId;
+        m.encPayoutId = encPayoutId;
         m.shopName = shopName;
-        emit MerchantProfileUpdated(msg.sender, payoutId, shopName);
+        emit MerchantProfileUpdated(msg.sender, shopName);
     }
 
     function _register(
-        string calldata payoutId,
+        bytes calldata encPayoutId,
         string calldata shopName,
         bytes32 currency
     ) internal {
         if (registered[msg.sender]) revert AlreadyRegistered();
         if (currency == bytes32(0)) revert InvalidCurrency();
         // A payout target is required — without it fiat withdrawals have nowhere
-        // to land (same rule updateProfile enforces).
-        if (bytes(payoutId).length == 0) revert InvalidAddress();
+        // to land (same rule updateProfile enforces). Opaque, non-empty blob.
+        if (encPayoutId.length == 0) revert InvalidAddress();
         // AUDIT (MED): enforce CANONICAL bytes32 form on BOTH entry points —
         // left-aligned code, zero-padded, no non-zero byte after the first NUL.
         // registerMerchant's toCurrency already guarantees this; without the same
@@ -417,11 +515,11 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         }
         Merchant storage m = merchants[msg.sender];
         m.merchantAddr = msg.sender;
-        m.payoutId = payoutId;
+        m.encPayoutId = encPayoutId;
         m.shopName = shopName;
         m.currency = currency;
         registered[msg.sender] = true;
-        emit MerchantRegistered(msg.sender, payoutId, shopName, currency);
+        emit MerchantRegistered(msg.sender, shopName, currency);
     }
 
     // ─── IP2PIntegrator ───────────────────────────────────────────────
@@ -477,11 +575,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         address user,
         uint256 amount,
         address /* recipientAddr */
-    ) external onlyDiamond {
+    ) external onlyDiamond nonReentrant {
         // recipientAddr = the merchant's proxy (usdcThroughIntegrator =
-        // false): the Diamond just sent USDC there. Pull it into this
-        // integrator, where it sits until the settlement bucket unlocks.
+        // false): the Diamond just sent USDC there. Pull it into this integrator,
+        // then forward it into the VAULT (custody), where it sits until the
+        // settlement bucket unlocks. The integrator never keeps the funds.
         UserProxy(proxyAddress(user)).transferERC20ToIntegrator(address(usdc), amount);
+        _toVault(amount);
 
         _creditBucket(merchants[user], amount, block.timestamp + SETTLEMENT_PERIOD);
         merchants[user].totalDeposited += amount;
@@ -493,7 +593,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         validateOrder. Tolerates unknown orderIds; deletes the
     ///         orderToMerchant entry so a repeated cancellation cannot
     ///         double-decrement.
-    function onOrderCancel(uint256 orderId) external onlyDiamond {
+    function onOrderCancel(uint256 orderId) external onlyDiamond nonReentrant {
         address merchant = orderToMerchant[orderId];
         if (merchant == address(0)) return; // SELL or unknown — nothing to release
         Merchant storage m = merchants[merchant];
@@ -617,9 +717,10 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         _deductUnlocked(m, amount);
 
         // Per-merchant proxy: funds for THIS merchant's SELL sit only on the
-        // merchant's own proxy, never commingled with other merchants'.
+        // merchant's own proxy, never commingled with other merchants'. The
+        // principal comes OUT OF THE VAULT to the proxy for the SELL placement.
         address merchantProxy = _ensureProxy(m.merchantAddr);
-        usdc.safeTransfer(merchantProxy, amount);
+        _vaultPull(merchantProxy, amount);
         // userPubKey = the relay pubkey (NOT the payout). The payout/UPI is set
         // later, encrypted, via deliverFiatPayout -> setSellOrderUpi.
         bytes memory data = abi.encodeCall(
@@ -663,8 +764,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     function deliverFiatPayout(uint256 orderId, string calldata encPayout) external nonReentrant {
         PendingWithdrawal storage w = withdrawals[orderId];
         if (w.merchant == address(0)) revert WithdrawalNotFound();
-        // Only the merchant, owner, or trusted relayer — never an arbitrary caller.
-        if (msg.sender != w.merchant && msg.sender != owner && msg.sender != trustedRelayer)
+        // Only the merchant, an owner, or the trusted relayer — never arbitrary.
+        if (msg.sender != w.merchant && !isOwner[msg.sender] && msg.sender != trustedRelayer)
             revert OnlyOwner();
         if (w.settled) revert WithdrawalAlreadySettled();
         if (w.upiDelivered) revert WithdrawalAlreadySettled();
@@ -693,8 +794,8 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         // `needed` = principal + fee, so we top up the fee delta — but HIGH-1:
         // that fee is CHARGED TO THE WITHDRAWING MERCHANT (debited from their
         // own unlocked buckets), never sourced from the commingled pool. The
-        // pool only physically forwards it; `totalOwed` drops by the fee, so the
-        // solvency invariant `balanceOf(this) >= totalOwed` is preserved.
+        // vault only physically forwards it; `totalOwed` drops by the fee, so the
+        // solvency invariant `vault.balance() >= totalOwed` is preserved.
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
         if (proxyBal < needed) {
             uint256 topUp = needed - proxyBal;
@@ -702,9 +803,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
             // InsufficientAvailableBalance if they can't cover it — the merchant
             // pays their own offramp fee, exactly like any real withdrawal.
             _deductUnlocked(m, topUp);
-            if (usdc.balanceOf(address(this)) < topUp) revert OfframpInsufficientPool();
+            if (_pool() < topUp) revert OfframpInsufficientPool();
             w.feeAdvanced = topUp; // recorded so reconcile attributes it exactly
-            usdc.safeTransfer(merchantProxy, topUp);
+            _vaultPull(merchantProxy, topUp); // fee comes out of the vault
         }
 
         // Grant the Diamond an allowance of exactly `needed` and call
@@ -721,12 +822,12 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     }
 
     /// @notice Withdraw unlocked USDC straight to the merchant's wallet.
-    ///         Funds sit on this integrator (pulled at onOrderComplete).
+    ///         Funds are custodied in the vault and pulled out to the merchant.
     function withdrawUSDC(uint256 amount) external nonReentrant {
         Merchant storage m = _checkWithdraw(amount);
         _deductUnlocked(m, amount);
 
-        usdc.safeTransfer(msg.sender, amount);
+        _vaultPull(msg.sender, amount);
 
         emit WithdrawalUSDC(msg.sender, amount);
     }
@@ -773,13 +874,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         Merchant storage m = merchants[w.merchant];
         if (m.inFlightWithdrawals > 0) m.inFlightWithdrawals--;
 
-        // MED-3: sweep the ENTIRE proxy balance back to the pool. Whatever the
+        // MED-3: sweep the ENTIRE proxy balance back to the VAULT. Whatever the
         // Diamond refunded (principal only for PLACED→CANCELLED, principal+fee
-        // for PAID→CANCELLED) is now physically here.
+        // for PAID→CANCELLED) is swept proxy → integrator → vault (custody).
         address merchantProxy = _ensureProxy(w.merchant);
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
         if (proxyBal > 0) {
             UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), proxyBal);
+            _toVault(proxyBal);
         }
 
         // Re-credit principal + any fee advanced (the fee was charged to the
@@ -805,7 +907,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         tracking slot). Permissionless; only flips a withdrawal whose
     ///         Diamond status is COMPLETED, so it cannot be abused to block
     ///         a legitimate reconciliation.
-    function finalizeWithdrawal(uint256 orderId) external {
+    function finalizeWithdrawal(uint256 orderId) external nonReentrant {
         PendingWithdrawal storage w = withdrawals[orderId];
         if (w.merchant == address(0)) revert UnknownWithdrawal();
         if (w.settled) revert WithdrawalAlreadySettled();
@@ -915,15 +1017,20 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     // ─── Admin ────────────────────────────────────────────────────────
 
-    /// @notice OWNER-ONLY: assign an admin's role tier. This is the single entry
-    ///         point for role-based access. Roles are hierarchical — a higher tier
-    ///         includes every lower tier's powers. Pass Role.NONE to revoke. Keeps
-    ///         the legacy `admins` bool in sync (true for any non-NONE role) so
-    ///         isAdmin / existing integrations keep working. No redeploy needed.
+    /// @notice SUPER-ADMIN-ONLY: assign an admin's role tier. This is the single
+    ///         entry point for role-based access. Roles are hierarchical — a higher
+    ///         tier includes every lower tier's powers. Pass Role.NONE to revoke.
+    ///         Keeps the legacy `admins` bool in sync (true for any non-NONE role)
+    ///         so isAdmin / existing integrations keep working. No redeploy needed.
+    ///         Only the super-admin (not other owners) may assign roles.
     /// @param who  The admin wallet.
     /// @param role 0=NONE(revoke) 1=VIEWER 2=SUPPORT 3=MANAGER 4=FINANCE.
-    function setRole(address who, Role role) public onlyOwner {
+    function setRole(address who, Role role) public onlySuperAdmin {
         if (who == address(0)) revert InvalidAddress();
+        // The super-admin's own tier is FINANCE-by-virtue-of-superAdmin and can
+        // never be lowered — refuse any attempt to set a role on the super-admin
+        // (its access does not come from adminRole and must stay untouchable).
+        if (who == superAdmin) revert CannotRemoveSuperAdmin();
         bool wasAdmin = adminRole[who] != Role.NONE;
         adminRole[who] = role;
         admins[who] = role != Role.NONE;
@@ -933,28 +1040,181 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (role == Role.NONE && wasAdmin) emit AdminRemoved(who);
     }
 
-    /// @notice OWNER-ONLY: add an admin. Back-compat shim — grants FINANCE (the
-    ///         full admin tier, matching the previous flat-admin behaviour where a
-    ///         single admin could do everything). Use setRole(who, <tier>) for a
-    ///         narrower role (e.g. Role.SUPPORT for freeze-only, Role.VIEWER for
-    ///         read-only).
-    function addAdmin(address who) external onlyOwner {
+    /// @notice SUPER-ADMIN-ONLY: add an admin. Back-compat shim — grants FINANCE
+    ///         (the full admin tier, matching the previous flat-admin behaviour
+    ///         where a single admin could do everything). Use setRole(who, <tier>)
+    ///         for a narrower role (e.g. Role.SUPPORT for freeze-only, Role.VIEWER
+    ///         for read-only).
+    function addAdmin(address who) external onlySuperAdmin {
         setRole(who, Role.FINANCE);
     }
 
-    /// @notice OWNER-ONLY: remove an admin (revoke all roles).
-    function removeAdmin(address who) external onlyOwner {
+    /// @notice SUPER-ADMIN-ONLY: remove an admin (revoke all roles).
+    function removeAdmin(address who) external onlySuperAdmin {
         setRole(who, Role.NONE);
     }
 
-    /// @notice OWNER-ONLY: move root ownership (e.g. to a team multisig). The new
-    ///         owner then controls the admin set and can transfer again. Reverts
-    ///         on the zero address to avoid bricking admin control.
-    function transferOwnership(address newOwner) external onlyOwner {
+    /// @notice SUPER-ADMIN-ONLY: add another main owner (full access). Only the
+    ///         super-admin may grow the owner set — a regular owner cannot add or
+    ///         remove owners.
+    function addOwner(address who) external onlySuperAdmin {
+        if (who == address(0)) revert InvalidAddress();
+        if (isOwner[who]) revert AlreadyRegistered();
+        _addOwner(who);
+    }
+
+    /// @notice SUPER-ADMIN-ONLY: remove an owner. The super-admin can NEVER be
+    ///         removed (CannotRemoveSuperAdmin), and the LAST owner can never be
+    ///         removed either (the contract is never orphaned). Only the super-admin
+    ///         may remove owners.
+    function removeOwner(address who) external onlySuperAdmin {
+        if (!isOwner[who]) revert InvalidAddress();
+        // The super-admin is unremovable by anyone, including via the owner path.
+        if (who == superAdmin) revert CannotRemoveSuperAdmin();
+        if (ownerCount == 1) revert LastOwner();
+        isOwner[who] = false;
+        ownerCount--;
+        emit OwnerRemoved(who);
+    }
+
+    /// @notice SUPER-ADMIN-ONLY: hand off the super-admin role to `next`. This is
+    ///         the ONLY way the super-admin ever changes — there is no removal
+    ///         path. `next` becomes an owner if it isn't already (so it keeps full
+    ///         powers), and the PREVIOUS super-admin REMAINS an owner (it is not
+    ///         auto-evicted; the new super-admin can removeOwner(previous) later if
+    ///         desired). Use this to move root control to a multisig after deploy.
+    /// @param next The new super-admin. Must be non-zero and not the current one.
+    function transferSuperAdmin(address next) external onlySuperAdmin {
+        if (next == address(0)) revert InvalidAddress();
+        if (next == superAdmin) revert InvalidAddress(); // no-op handoff
+        if (!isOwner[next]) _addOwner(next); // the super-admin is always an owner
+        address prev = superAdmin;
+        superAdmin = next;
+        emit SuperAdminTransferred(prev, next);
+    }
+
+    function _addOwner(address who) internal {
+        isOwner[who] = true;
+        ownerCount++;
+        emit OwnerAdded(who);
+    }
+
+    // ─── Vault fund helpers ───────────────────────────────────────────
+    // Funds are custodied in the vault, not here. `_toVault` forwards USDC this
+    // integrator just received (from a proxy) into the vault; `_vaultPull` moves
+    // USDC out of the vault to a recipient; `_pool` reads the vault's balance for
+    // solvency/fee checks. All money movement in the contract goes through these.
+
+    /// @dev Forward `amount` of USDC held by THIS integrator into the vault.
+    ///      If the vault isn't wired yet (vault==0, e.g. an integrator-first
+    ///      deploy before setVault), the USDC simply STAYS on the integrator
+    ///      rather than reverting — the deposit/credit path must be infallible, a
+    ///      Diamond completion callback must never revert on operator wiring
+    ///      state. Held USDC can't leak (the integrator's only exits, _toVault and
+    ///      _vaultPull, are both vault-gated) and is forwarded later by
+    ///      flushToVault once the link is set. In steady state (vault set) this is
+    ///      an immediate forward, exactly as before.
+    function _toVault(uint256 amount) internal {
+        if (amount > 0 && vault != address(0)) usdc.safeTransfer(vault, amount);
+    }
+
+    /// @dev Move `amount` USDC out of the vault to `to`.
+    function _vaultPull(address to, uint256 amount) internal {
+        if (vault == address(0)) revert VaultNotSet();
+        if (amount > 0) IPayQRVault(vault).pull(to, amount);
+    }
+
+    /// @dev The pool backing merchant funds = what the vault holds PLUS any USDC
+    ///      transiently held on the integrator itself (the vault-unset window; ~0
+    ///      in steady state, since _toVault forwards immediately once wired). This
+    ///      keeps the solvency base honest in both regimes.
+    function _pool() internal view returns (uint256) {
+        uint256 held = usdc.balanceOf(address(this));
+        return vault == address(0) ? held : IPayQRVault(vault).balance() + held;
+    }
+
+    /// @notice Back-compat: transferOwnership now means "add the new owner and drop
+    ///         the caller" (a 1→1 handoff). With multi-owner, prefer addOwner /
+    ///         removeOwner. Super-admin-only (it mutates the owner set), and it can
+    ///         NEVER drop the super-admin — the super-admin must always stay an
+    ///         owner. To move ROOT control, use transferSuperAdmin instead.
+    function transferOwnership(address newOwner) external onlySuperAdmin {
         if (newOwner == address(0)) revert InvalidAddress();
-        address prev = owner;
-        owner = newOwner;
-        emit OwnershipTransferred(prev, newOwner);
+        // Guard the self-transfer foot-gun: transferOwnership(self) would fall
+        // through to the drop-caller branch below and silently REMOVE the caller
+        // (a pure self-eviction, not a handoff). A handoff to yourself is a no-op
+        // by intent, so reject it explicitly rather than strip ownership.
+        if (newOwner == msg.sender) revert InvalidAddress();
+        // The caller is the super-admin (onlySuperAdmin), who must ALWAYS remain an
+        // owner — dropping it below would leave the super-admin not-an-owner (it
+        // would lose FINANCE-tier owner powers while still gating governance). So
+        // add the new owner but do NOT evict the super-admin caller. Root handoff
+        // is transferSuperAdmin's job, not this shim's.
+        if (!isOwner[newOwner]) _addOwner(newOwner);
+        emit OwnershipTransferred(msg.sender, newOwner);
+    }
+
+    /// @notice SUPER-ADMIN-ONLY: point the integrator at the custody vault.
+    ///         Repointing custody is a root-of-trust action (every _vaultPull
+    ///         flows through `vault`), so it is restricted to the super-admin, not
+    ///         every owner. Needed so a migration can wire a fresh integrator to
+    ///         the existing vault. After
+    ///         this, the vault side must separately authorise this integrator via
+    ///         vault.setIntegrator — which now REQUIRES this integrator's `vault`
+    ///         to already equal that vault (the mutual handshake). So the correct
+    ///         wiring order is: setVault(theVault) here, THEN vault.setIntegrator(
+    ///         thisIntegrator) — the handshake makes an asymmetric link impossible.
+    function setVault(address v) external onlySuperAdmin {
+        if (v == address(0)) revert InvalidAddress();
+        vault = v;
+        emit VaultSet(v);
+    }
+
+    /// @notice SUPER-ADMIN-ONLY, ONE-SHOT: forward any USDC transiently held on this
+    ///         integrator into the vault. Only relevant after an integrator-first
+    ///         deploy where a BUY completed before setVault was wired (the deposit
+    ///         was credited and the USDC parked here — see _toVault). Once the
+    ///         vault is set, call this to move the parked balance into custody so
+    ///         vault.balance() once again covers totalOwed. A harmless no-op when
+    ///         nothing is held.
+    function flushToVault() external onlySuperAdmin {
+        if (vault == address(0)) revert VaultNotSet();
+        uint256 held = usdc.balanceOf(address(this));
+        if (held > 0) usdc.safeTransfer(vault, held);
+        emit FlushedToVault(held);
+    }
+
+    /// @notice SUPER-ADMIN-ONLY, ONE-SHOT: seed this integrator's totalOwed from a PRIOR
+    ///         integrator when migrating onto a shared vault. The vault holds all
+    ///         USDC and is repointed to a fresh integrator on migration; but
+    ///         totalOwed (the accounting) lives in the integrator, so a fresh one
+    ///         would start at 0 while inheriting the full vault balance — a silent
+    ///         desync between custody and accounting. Copying the prior total
+    ///         re-establishes the invariant vault.balance() >= totalOwed at cutover.
+    ///
+    /// @dev    IMPORTANT — this copies ONLY the scalar totalOwed, NOT per-merchant
+    ///         buckets. Per-merchant balances do not carry over, so migrateState is
+    ///         for a controlled cutover where merchant-level state is re-established
+    ///         off the old integrator's events (or the old integrator is drained
+    ///         first and this is left unused, totalOwed staying 0). It exists to
+    ///         make the AGGREGATE solvency base correct and to give operators an
+    ///         explicit, audited migration primitive rather than a silent gap.
+    ///         One-shot (stateMigrated guard) and only callable before any local
+    ///         accounting exists (totalOwed must be 0), so it can never corrupt a
+    ///         live ledger.
+    function migrateState(address priorIntegrator) external onlySuperAdmin {
+        if (stateMigrated) revert AlreadyMigrated();
+        if (priorIntegrator == address(0) || vault == address(0) || totalOwed != 0)
+            revert MigrateStatePreconditions();
+        stateMigrated = true;
+        uint256 prior = IPriorIntegrator(priorIntegrator).totalOwed();
+        // Sanity guard against a wrong-prior fat-finger: the seeded aggregate can
+        // never exceed the custody actually adopted, or the solvency invariant
+        // (vault.balance() >= totalOwed) would be born already violated. The vault
+        // should be quiesced (locked / repointed) before this cutover.
+        if (prior > IPayQRVault(vault).balance()) revert MigrateStatePreconditions();
+        totalOwed = prior;
+        emit MigratedState(priorIntegrator, prior);
     }
 
     /// @notice Set (or clear) the per-transaction USDC cap for a currency. Lets
@@ -1023,6 +1283,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
         if (proxyBal > 0) {
             UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), proxyBal);
+            _toVault(proxyBal); // sweep proxy → integrator → vault (custody)
         }
         // Make the merchant whole for principal + any fee advanced (capped by
         // the actual proxy refund, so still double-spend-safe).
@@ -1066,6 +1327,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         uint256 proxyBal = usdc.balanceOf(merchantProxy);
         if (proxyBal > 0) {
             UserProxy(merchantProxy).transferERC20ToIntegrator(address(usdc), proxyBal);
+            _toVault(proxyBal); // sweep proxy → integrator → vault (custody)
         }
         // Make whole for principal + fee, capped by the physical refund.
         uint256 owedBack = w.amount + w.feeAdvanced;
@@ -1109,17 +1371,18 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     }
 
     /// @notice On-chain merchant profile, so the UI needs no off-chain store.
-    ///         Returns the saved payout id (where fiat withdrawals are paid),
-    ///         shop name, offramp currency, registration status, and freeze status.
+    ///         Returns the ENCRYPTED payout handle (opaque ciphertext — only the
+    ///         merchant/LP can decrypt it; the raw handle is never on-chain in the
+    ///         clear), shop name, offramp currency, registration + freeze status.
     function getMerchantInfo(
         address merchant
     )
         external
         view
-        returns (string memory payoutId, string memory shopName, bytes32 currency, bool isRegistered, bool isFrozen)
+        returns (bytes memory encPayoutId, string memory shopName, bytes32 currency, bool isRegistered, bool isFrozen)
     {
         Merchant storage m = merchants[merchant];
-        return (m.payoutId, m.shopName, m.currency, registered[merchant], m.isFrozen);
+        return (m.encPayoutId, m.shopName, m.currency, registered[merchant], m.isFrozen);
     }
 
     function getDailyTxInfo(

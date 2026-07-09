@@ -31,14 +31,15 @@ const ERC20_TRANSFER = [{
   outputs: [{ type: "bool" }],
 }] as const;
 
-// Matches the NEW multi-currency contract: getMerchantInfo returns 5 values
-// (payoutId, shopName, currency, isRegistered, isFrozen). Indices 0/1 (payout,
-// shop) are unchanged from the old 4-return shape, so the reads below still hold.
+// getMerchantInfo returns 5 values (encPayoutId, shopName, currency,
+// isRegistered, isFrozen). [0] is now the ENCRYPTED payout blob (bytes) — decrypt
+// client-side for display (see lib/payoutCrypto.ts); the raw handle is never
+// on-chain in plaintext.
 const INFO_ABI = [{
   type: "function", name: "getMerchantInfo", stateMutability: "view",
   inputs: [{ name: "merchant", type: "address" }],
   outputs: [
-    { name: "payoutId", type: "string" }, { name: "shopName", type: "string" },
+    { name: "encPayoutId", type: "bytes" }, { name: "shopName", type: "string" },
     { name: "currency", type: "bytes32" },
     { name: "isRegistered", type: "bool" }, { name: "isFrozen", type: "bool" },
   ],
@@ -86,7 +87,8 @@ export function WalletSheet({
     args: [address as `0x${string}`], query: { enabled: !!address && open, refetchInterval: 20000 },
   });
 
-  const payoutId = info?.[0] || "";
+  // info[0] is the encrypted payout blob; the wallet sheet doesn't display the
+  // handle (only shop/balance), so we don't decrypt it here. Kept for shape.
   const shopName = info?.[1] || "";
   const pending = balance?.[0] ?? 0n;
   const available = balance?.[1] ?? 0n;

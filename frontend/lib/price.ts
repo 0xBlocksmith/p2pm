@@ -211,17 +211,16 @@ export type Quote = {
   /** product-2 quantity (0.01-USDC units) — usdcAmount / 1e4. */
   quantity: bigint;
   /**
-   * The small-order fixed fee in USDC (6-dec), 0 above the threshold. On the BUY
-   * flow this is borne by the CUSTOMER (added to the fiat they pay) — the merchant
-   * still receives the full usdcAmount. Surfaced only so the terminal can show the
-   * customer's all-in fiat cost transparently.
+   * The small-order fixed fee in USDC (6-dec), 0 above the threshold. It is
+   * DEDUCTED from the entered amount: the customer pays exactly the fiat the
+   * merchant typed, and this fee comes out of the merchant's proceeds.
    */
   feeUsdc: bigint;
-  /** USDC the merchant receives = the full order amount (fee is customer-side on BUY). */
+  /** USDC the merchant receives = usdcAmount − feeUsdc (the merchant absorbs the fee). */
   creditedUsdc: bigint;
-  /** fiat the merchant's order is worth (usdcAmount*buyPrice/1e6), before the fee. */
+  /** fiat the merchant's ORDER is worth (usdcAmount*buyPrice/1e6), before the fee. */
   subtotalFiat: bigint;
-  /** fiat the CUSTOMER pays all-in = subtotalFiat + feeFiat — matches the widget's total. */
+  /** fiat the CUSTOMER pays all-in = subtotal + fee ≈ the entered amount (fee is baked in). */
   totalFiat: bigint;
   /** convenience floats for display (already /1e6). */
   usdc: number;
@@ -235,34 +234,62 @@ export type Quote = {
  * widget's fiat = usdc*buyPrice/1e6. Quantizes usdcAmount to the 0.01-USDC unit
  * exactly as qr/page.tsx does (so the on-chain order total is what we show).
  *
- * FEE INCIDENCE (verified against the widget's orderBreakdown, checkout.js):
- *   On BUY, the small-order fixed fee is ADDED to the fiat the customer pays; the
- *   merchant receives the full usdcAmount. So `credited` = usdcAmount (NOT minus
- *   the fee), and `total` (customer's fiat) = subtotal + fee.
+ * FEE MODEL (fee taken OUT of the entered amount, not added on top):
+ *   The widget always computes the customer's total as subtotal + fee. To make
+ *   the customer pay EXACTLY the entered fiat, we size the order so that
+ *   subtotal = entered − fee. Then the widget's total = (entered − fee) + fee =
+ *   entered (to the cent), and the merchant receives usdcAmount − fee. So the fee
+ *   is effectively collected from the merchant's proceeds, and `credited` =
+ *   usdcAmount − feeUsdc.
+ *
+ *   Because the fee threshold is defined on the ORDER amount (usdcAmount), and
+ *   sizing for (entered − fee) can nudge usdcAmount across that threshold, we
+ *   solve it in two passes: size for the gross first to learn whether the fee
+ *   applies, then, if it does, re-size for (entered − feeFiat).
  *
  * @param fiatAmount  the local-currency amount the merchant typed (e.g. 1000 for ₹1000)
  * @param p           the on-chain price from fetchOnchainPrice
  */
 export function quoteFromFiat(fiatAmount: number, p: OnchainPrice): Quote {
   // fiat(6-dec) = usd(6-dec) * buyPrice / 1e6  ⇒  usd = fiat * 1e6 / buyPrice.
-  // Do it in 6-dec fixed point to match on-chain rounding, then quantize to the
-  // 0.01-USDC product unit (round to nearest cent) so usdcAmount is a clean
-  // multiple of 1e4 — identical to qr/page.tsx's quantity math.
-  const fiat6 = BigInt(Math.round(fiatAmount * 1e6));
-  const rawUsdc6 = p.buyPrice > 0n ? (fiat6 * 1_000_000n) / p.buyPrice : 0n;
-  // Quantize to 0.01 USDC (nearest cent) → quantity units, then back to 6-dec.
-  const quantity = (rawUsdc6 + 5_000n) / 10_000n; // +half-cent for round-to-nearest
-  const usdcAmount = quantity * 10_000n;
-
-  const feeUsdc =
+  // Quantize to the 0.01-USDC product unit (nearest cent) so usdcAmount is a
+  // clean multiple of 1e4 — identical to qr/page.tsx's quantity math.
+  const sizeFor = (fiat6: bigint): bigint => {
+    const rawUsdc6 = p.buyPrice > 0n ? (fiat6 * 1_000_000n) / p.buyPrice : 0n;
+    const q = (rawUsdc6 + 5_000n) / 10_000n; // +half-cent for round-to-nearest
+    return q;
+  };
+  const feeFor = (usdcAmount: bigint): bigint =>
     p.smallOrderThreshold > 0n && usdcAmount > 0n && usdcAmount <= p.smallOrderThreshold
       ? p.smallOrderFixedFee
       : 0n;
-  // Merchant receives the whole order amount; the fee is the customer's on BUY.
-  const creditedUsdc = usdcAmount;
+
+  const enteredFiat6 = BigInt(Math.round(fiatAmount * 1e6));
+
+  // Pass 1: size for the FULL entered amount to discover whether the small-order
+  // fee applies at this order size.
+  let quantity = sizeFor(enteredFiat6);
+  let usdcAmount = quantity * 10_000n;
+  let feeUsdc = feeFor(usdcAmount);
+
+  // Pass 2: if a fee applies, re-size the order so subtotal = entered − feeFiat,
+  // making the widget's (subtotal + fee) land back on the entered amount. The fee
+  // then comes out of what the merchant keeps.
+  if (feeUsdc > 0n) {
+    const feeFiat = (feeUsdc * p.buyPrice) / 1_000_000n;
+    const netFiat6 = enteredFiat6 > feeFiat ? enteredFiat6 - feeFiat : 0n;
+    quantity = sizeFor(netFiat6);
+    usdcAmount = quantity * 10_000n;
+    // Recompute incidence at the new (smaller) order size — it's still ≤ threshold,
+    // so the fee stays; feeUsdc is unchanged, but recompute defensively.
+    feeUsdc = feeFor(usdcAmount);
+  }
+
+  // The merchant absorbs the fee: they receive the order amount minus it.
+  const creditedUsdc = usdcAmount > feeUsdc ? usdcAmount - feeUsdc : 0n;
   const feeFiat = (feeUsdc * p.buyPrice) / 1_000_000n;
   const subtotalFiat = (usdcAmount * p.buyPrice) / 1_000_000n;
-  const totalFiat = subtotalFiat + feeFiat;
+  const totalFiat = subtotalFiat + feeFiat; // ≈ the entered amount
 
   return {
     usdcAmount,

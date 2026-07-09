@@ -22,7 +22,7 @@ import { Icon } from "./Icons";
  *               already-placed order instead (resuming a payment the merchant
  *               reopened this dialog for)
  *   usdcAmount  bigint (6-dec) — what the merchant is charging
- *   quantity    bigint — product-2 units (USDC cents) for our userPlaceOrder
+ *   quantity    bigint — product-2 units (6-dec USDC units) for our userPlaceOrder
  *   productName string
  *   onComplete  (orderId) => void
  *   onClose     () => void

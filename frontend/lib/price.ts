@@ -29,6 +29,7 @@
 import { createPublicClient, http, stringToHex } from "viem";
 import { ACTIVE_CHAIN, RPC_URL } from "./chain";
 import { DIAMOND_ADDRESS } from "./p2p";
+import { USDC_UNIT } from "./contract";
 
 // Minimal slice of the Diamond ABI — the exact selectors the widget uses to
 // price an order. Mirrors @p2pdotme/widgets DIAMOND_ABI (getPriceConfig tuple +
@@ -208,7 +209,7 @@ export async function fetchOnchainPrice(currencyCode: string): Promise<OnchainPr
 export type Quote = {
   /** the order amount in USDC (6-dec) — what userPlaceOrder is for; equals the widget's usdcAmount. */
   usdcAmount: bigint;
-  /** product-2 quantity (0.01-USDC units) — usdcAmount / 1e4. */
+  /** product-2 quantity (USDC_UNIT 6-dec units) — usdcAmount / USDC_UNIT. */
   quantity: bigint;
   /**
    * The small-order fixed fee in USDC (6-dec), 0 above the threshold. It is
@@ -252,11 +253,12 @@ export type Quote = {
  */
 export function quoteFromFiat(fiatAmount: number, p: OnchainPrice): Quote {
   // fiat(6-dec) = usd(6-dec) * buyPrice / 1e6  ⇒  usd = fiat * 1e6 / buyPrice.
-  // Quantize to the 0.01-USDC product unit (nearest cent) so usdcAmount is a
-  // clean multiple of 1e4 — identical to qr/page.tsx's quantity math.
+  // Quantize to the product unit (USDC_UNIT 6-dec units, nearest unit) so
+  // usdcAmount is a clean multiple of it — identical to qr/page.tsx's quantity
+  // math. At USDC_UNIT = 1 this is full 6-dec precision (quantity == usdcAmount).
   const sizeFor = (fiat6: bigint): bigint => {
     const rawUsdc6 = p.buyPrice > 0n ? (fiat6 * 1_000_000n) / p.buyPrice : 0n;
-    const q = (rawUsdc6 + 5_000n) / 10_000n; // +half-cent for round-to-nearest
+    const q = (rawUsdc6 + USDC_UNIT / 2n) / USDC_UNIT; // +half-unit → round-to-nearest
     return q;
   };
   const feeFor = (usdcAmount: bigint): bigint =>
@@ -269,7 +271,7 @@ export function quoteFromFiat(fiatAmount: number, p: OnchainPrice): Quote {
   // Pass 1: size for the FULL entered amount to discover whether the small-order
   // fee applies at this order size.
   let quantity = sizeFor(enteredFiat6);
-  let usdcAmount = quantity * 10_000n;
+  let usdcAmount = quantity * USDC_UNIT;
   let feeUsdc = feeFor(usdcAmount);
 
   // Pass 2: if a fee applies, re-size the order so subtotal = entered − feeFiat,
@@ -279,7 +281,7 @@ export function quoteFromFiat(fiatAmount: number, p: OnchainPrice): Quote {
     const feeFiat = (feeUsdc * p.buyPrice) / 1_000_000n;
     const netFiat6 = enteredFiat6 > feeFiat ? enteredFiat6 - feeFiat : 0n;
     quantity = sizeFor(netFiat6);
-    usdcAmount = quantity * 10_000n;
+    usdcAmount = quantity * USDC_UNIT;
     // Recompute incidence at the new (smaller) order size — it's still ≤ threshold,
     // so the fee stays; feeUsdc is unchanged, but recompute defensively.
     feeUsdc = feeFor(usdcAmount);

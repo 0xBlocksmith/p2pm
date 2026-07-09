@@ -163,7 +163,7 @@ export async function isPaymentPartnerAvailable(
  *
  * @param signer        CheckoutSigner (thirdweb smart-account adapter)
  * @param publicClient  viem public client for receipt parsing
- * @param quantity      bigint product-2 units (USDC cents)
+ * @param quantity      bigint product-2 units (6-dec USDC units; see USDC_UNIT)
  * @param getIdentity   async () => RelayIdentity ({ publicKey })
  */
 export function makePlaceOrder({ signer, publicClient, quantity, getIdentity }) {

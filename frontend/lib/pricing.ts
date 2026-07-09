@@ -100,10 +100,11 @@ export async function fetchPriceConfig(code: string): Promise<PriceConfig | null
   }
 }
 
-// Our integrator prices in whole USDC CENTS (product-2 units = 0.01 USDC) — the
-// on-chain `quantity` can't represent anything finer, so usdcAmount must always
-// be a multiple of this.
-const USDC_CENT = 10_000n; // 6-dec units
+// DEPRECATED: superseded by lib/price.ts (quoteFromFiat). Kept for reference only.
+// The integrator now prices product-2 at 0.000001 USDC/unit, so usdcAmount can be
+// any 6-dec value — the old whole-cent grid (10_000n) is gone. See USDC_UNIT in
+// lib/contract.ts for the live granularity.
+const USDC_CENT = 1n; // 6-dec units per product-2 unit (was 10_000n; grid removed)
 
 /**
  * Size the USDC amount so the customer's on-chain total lands as close as

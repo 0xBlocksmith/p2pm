@@ -104,12 +104,21 @@ describe("PayQRVault — custody, airtight pull, lock, migration, multi-owner", 
     await expect(integrator.doPull(alice.address, USDC(5))).to.emit(vault, "Pulled");
   });
 
-  it("only an owner can lock / unlock / setIntegrator", async function () {
+  it("kill-switch lock/unlock is owner-gated; setIntegrator is super-admin-gated", async function () {
+    // lock/unlock: any OWNER (broad break-glass), rejected for a non-owner.
     await expect(vault.connect(attacker).lock()).to.be.revertedWithCustomError(vault, "NotOwner");
+    // setIntegrator: super-admin ONLY — even a non-super-admin owner can't repoint.
+    await vault.connect(owner).addOwner(alice.address); // alice = owner, not super-admin
+    await expect(vault.connect(alice).setIntegrator(await integrator2.getAddress()))
+      .to.be.revertedWithCustomError(vault, "OnlySuperAdmin");
     await expect(vault.connect(attacker).setIntegrator(await integrator2.getAddress()))
-      .to.be.revertedWithCustomError(vault, "NotOwner");
+      .to.be.revertedWithCustomError(vault, "OnlySuperAdmin");
     await vault.connect(owner).lock();
     await expect(vault.connect(attacker).unlock()).to.be.revertedWithCustomError(vault, "NotOwner");
+    // ...but a plain owner CAN operate the kill-switch (that's the point).
+    await vault.connect(alice).unlock();
+    await vault.connect(alice).lock();
+    await vault.connect(alice).unlock();
   });
 
   it("MIGRATION: setIntegrator repoints; old integrator can no longer pull, new one can — funds never move", async function () {
@@ -132,23 +141,73 @@ describe("PayQRVault — custody, airtight pull, lock, migration, multi-owner", 
       .to.be.revertedWithCustomError(vault, "NotIntegrator");
   });
 
-  it("MULTI-OWNER: add/remove owners, each full access, last owner can't be removed", async function () {
+  it("SUPER-ADMIN owner set: only super-admin adds/removes owners; owners get the kill-switch, not governance", async function () {
     expect(await vault.ownerCount()).to.equal(1);
+    expect(await vault.superAdmin()).to.equal(owner.address);
+    // Super-admin adds a second owner.
     await expect(vault.connect(owner).addOwner(alice.address)).to.emit(vault, "OwnerAdded").withArgs(alice.address);
     expect(await vault.isOwner(alice.address)).to.equal(true);
-    // The second owner has full access (can setIntegrator, lock, add owners).
+    // The second owner has the OPERATIONAL kill-switch...
     await vault.connect(alice).lock();
     await vault.connect(alice).unlock();
-    await vault.connect(alice).addOwner(attacker.address);
-    expect(await vault.ownerCount()).to.equal(3);
-    // A genuine non-owner can't manage owners.
+    // ...but CANNOT manage the owner set (governance = super-admin only).
+    await expect(vault.connect(alice).addOwner(attacker.address))
+      .to.be.revertedWithCustomError(vault, "OnlySuperAdmin");
+    await expect(vault.connect(alice).removeOwner(owner.address))
+      .to.be.revertedWithCustomError(vault, "OnlySuperAdmin");
+    // A genuine non-owner can't either.
     await expect(vault.connect(stranger).removeOwner(owner.address))
-      .to.be.revertedWithCustomError(vault, "NotOwner");
-    // Remove down to one; last owner protected.
+      .to.be.revertedWithCustomError(vault, "OnlySuperAdmin");
+    // The super-admin can never be removed as an owner (even by itself).
+    await expect(vault.connect(owner).removeOwner(owner.address))
+      .to.be.revertedWithCustomError(vault, "CannotRemoveSuperAdmin");
+    // Super-admin adds a third then removes the non-super-admin owners down to itself.
+    await vault.connect(owner).addOwner(attacker.address);
+    expect(await vault.ownerCount()).to.equal(3);
     await vault.connect(owner).removeOwner(attacker.address);
     await vault.connect(owner).removeOwner(alice.address);
+    expect(await vault.ownerCount()).to.equal(1);
+    // Now only the super-admin remains; it still can't be removed.
     await expect(vault.connect(owner).removeOwner(owner.address))
-      .to.be.revertedWithCustomError(vault, "LastOwner");
+      .to.be.revertedWithCustomError(vault, "CannotRemoveSuperAdmin");
+  });
+
+  it("SUPER-ADMIN handoff: transferSuperAdmin is one-way, super-admin only, keeps root an owner", async function () {
+    expect(await vault.superAdmin()).to.equal(owner.address);
+    // Rejections: non-super-admin, zero address, no-op.
+    await expect(vault.connect(attacker).transferSuperAdmin(attacker.address))
+      .to.be.revertedWithCustomError(vault, "OnlySuperAdmin");
+    await expect(vault.connect(owner).transferSuperAdmin(ethers.ZeroAddress))
+      .to.be.revertedWithCustomError(vault, "InvalidAddress");
+    await expect(vault.connect(owner).transferSuperAdmin(owner.address))
+      .to.be.revertedWithCustomError(vault, "InvalidAddress");
+    // Hand off to alice → alice becomes super-admin AND an owner; prev stays an owner.
+    await expect(vault.connect(owner).transferSuperAdmin(alice.address))
+      .to.emit(vault, "SuperAdminTransferred").withArgs(owner.address, alice.address);
+    expect(await vault.superAdmin()).to.equal(alice.address);
+    expect(await vault.isOwner(alice.address)).to.equal(true);
+    expect(await vault.isOwner(owner.address)).to.equal(true);
+    // Old super-admin can no longer manage owners / integrator.
+    await expect(vault.connect(owner).addOwner(attacker.address))
+      .to.be.revertedWithCustomError(vault, "OnlySuperAdmin");
+    // New super-admin can, and can remove the old one as a plain owner.
+    await vault.connect(alice).removeOwner(owner.address);
+    expect(await vault.isOwner(owner.address)).to.equal(false);
+  });
+
+  it("constructor seeds superAdmin = deployer and emits SuperAdminTransferred(0, deployer)", async function () {
+    const Vault = await ethers.getContractFactory("PayQRVault");
+    const v2 = await Vault.deploy(await usdc.getAddress(), []);
+    expect(await v2.superAdmin()).to.equal(owner.address);
+    expect(await v2.isOwner(owner.address)).to.equal(true);
+    const ev = v2.interface.getEvent("SuperAdminTransferred");
+    const logs = await ethers.provider.getLogs({
+      address: await v2.getAddress(), topics: [ev!.topicHash], fromBlock: 0, toBlock: "latest",
+    });
+    const parsed = logs.map((l) => v2.interface.parseLog(l)!);
+    const seed = parsed.find((p) => p.args.previous === ethers.ZeroAddress);
+    expect(seed, "constructor should emit SuperAdminTransferred(0, deployer)").to.not.equal(undefined);
+    expect(seed!.args.next).to.equal(owner.address);
   });
 
   it("constructor seeds deployer + extra owners", async function () {

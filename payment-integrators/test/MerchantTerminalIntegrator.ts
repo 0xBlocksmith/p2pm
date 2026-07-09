@@ -688,11 +688,11 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         .to.emit(integrator, "MerchantFrozen");
       await integrator.connect(merchant2).unfreezeMerchant(merchant1.address);
 
-      // But an admin CANNOT add/remove admins or transfer ownership (owner-only).
+      // But an admin CANNOT add/remove admins or transfer ownership (super-admin only).
       await expect(integrator.connect(merchant2).addAdmin(attacker.address))
-        .to.be.revertedWithCustomError(integrator, "OnlyOwner");
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       await expect(integrator.connect(merchant2).transferOwnership(attacker.address))
-        .to.be.revertedWithCustomError(integrator, "OnlyOwner");
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
 
       // Owner removes the admin → can no longer freeze.
       await integrator.connect(owner).removeAdmin(merchant2.address);
@@ -753,11 +753,11 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       await expect(integrator.connect(admin).adminAbortWithdrawal(999999))
         .to.be.revertedWithCustomError(integrator, "UnknownWithdrawal");
 
-      // No tier can manage roles / ownership (owner-only).
+      // No tier can manage roles / ownership (super-admin only).
       await expect(integrator.connect(admin).setRole(attacker.address, 2))
-        .to.be.revertedWithCustomError(integrator, "OnlyOwner");
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       await expect(integrator.connect(admin).transferOwnership(attacker.address))
-        .to.be.revertedWithCustomError(integrator, "OnlyOwner");
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
 
       // ── Revoke (0). ──
       await integrator.connect(owner).setRole(admin.address, 0);
@@ -778,43 +778,106 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
       expect(await integrator.roleOf(attacker.address)).to.equal(0);
     });
 
-    it("transferOwnership hands off (adds new owner, drops caller) — multi-owner", async function () {
+    it("transferOwnership adds new owner but NEVER drops the super-admin caller", async function () {
+      // Only the super-admin (deployer) may call; a non-super-admin owner cannot.
+      await integrator.connect(owner).addOwner(merchant2.address);
+      await expect(integrator.connect(merchant2).transferOwnership(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       await expect(integrator.connect(attacker).transferOwnership(attacker.address))
-        .to.be.revertedWithCustomError(integrator, "OnlyOwner");
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
       await expect(integrator.connect(owner).transferOwnership(ethers.ZeroAddress))
         .to.be.revertedWithCustomError(integrator, "InvalidAddress");
-      // Hand off from the deployer to merchant2.
-      await integrator.connect(owner).transferOwnership(merchant2.address);
-      expect(await integrator.isOwner(merchant2.address)).to.equal(true);
-      expect(await integrator.isOwner(owner.address)).to.equal(false); // caller dropped
-      // New owner can manage admins; old owner cannot.
-      await integrator.connect(merchant2).addAdmin(merchant1.address);
-      await expect(integrator.connect(owner).addAdmin(attacker.address))
-        .to.be.revertedWithCustomError(integrator, "OnlyOwner");
+      // Super-admin "hands off" to merchant1 — merchant1 becomes an owner, but the
+      // super-admin is NOT dropped (root control must stay with the super-admin).
+      await integrator.connect(owner).transferOwnership(merchant1.address);
+      expect(await integrator.isOwner(merchant1.address)).to.equal(true);
+      expect(await integrator.isOwner(owner.address)).to.equal(true); // super-admin retained
+      expect(await integrator.superAdmin()).to.equal(owner.address);
+      // The new owner still cannot manage admins — that's super-admin only.
+      await expect(integrator.connect(merchant1).addAdmin(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
     });
 
-    it("MULTI-OWNER: add/remove owners; all have full access; last owner can't be removed", async function () {
-      // Deployer is the sole owner initially.
+    it("MULTI-OWNER: only super-admin manages the owner set; owners get FINANCE but not governance", async function () {
+      // Deployer is the sole owner AND the super-admin initially.
       expect(await integrator.isOwner(owner.address)).to.equal(true);
+      expect(await integrator.superAdmin()).to.equal(owner.address);
       expect(await integrator.ownerCount()).to.equal(1);
-      // Add a second owner → both have full (owner) access.
+      // Super-admin adds a second owner → it gets full FINANCE-tier access...
       await expect(integrator.connect(owner).addOwner(merchant2.address))
         .to.emit(integrator, "OwnerAdded").withArgs(merchant2.address);
       expect(await integrator.isOwner(merchant2.address)).to.equal(true);
       expect(await integrator.roleOf(merchant2.address)).to.equal(4); // FINANCE (top)
-      // Second owner can do owner-only things (e.g. setRole, addOwner).
-      await integrator.connect(merchant2).setRole(merchant1.address, 2);
-      await integrator.connect(merchant2).addOwner(attacker.address);
-      expect(await integrator.ownerCount()).to.equal(3);
-      // A non-owner cannot add/remove owners.
+      // ...but a NON-super-admin owner canNOT manage roles or owners.
+      await expect(integrator.connect(merchant2).setRole(merchant1.address, 2))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).addOwner(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).removeOwner(owner.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).addAdmin(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).removeAdmin(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      // ...BUT a non-super-admin owner DOES keep every FINANCE-tier OPERATIONAL
+      // power (the re-gating lifted only GOVERNANCE to the super-admin — it must
+      // NOT have stripped owners of their day-to-day admin actions). Prove it:
+      await expect(integrator.connect(merchant2).freezeMerchant(merchant1.address))
+        .to.emit(integrator, "MerchantFrozen").withArgs(merchant1.address);
+      await expect(integrator.connect(merchant2).unfreezeMerchant(merchant1.address))
+        .to.emit(integrator, "MerchantUnfrozen").withArgs(merchant1.address);
+      await expect(integrator.connect(merchant2).setDailyLimit(30))
+        .to.emit(integrator, "DailyLimitSet").withArgs(30);
+      // ...and canNOT repoint/seed custody (root-of-trust: super-admin only).
+      await expect(integrator.connect(merchant2).setVault(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).flushToVault())
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(merchant2).migrateState(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      // A non-owner likewise cannot.
       await expect(integrator.connect(merchant1).addOwner(merchant1.address))
-        .to.be.revertedWithCustomError(integrator, "OnlyOwner");
-      // Remove down to one; the LAST owner can't be removed.
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      // Super-admin adds a third owner then removes down.
+      await integrator.connect(owner).addOwner(attacker.address);
+      expect(await integrator.ownerCount()).to.equal(3);
       await integrator.connect(owner).removeOwner(attacker.address);
       await integrator.connect(owner).removeOwner(merchant2.address);
       expect(await integrator.ownerCount()).to.equal(1);
+      // The super-admin can never be removed as an owner (even by itself).
       await expect(integrator.connect(owner).removeOwner(owner.address))
-        .to.be.revertedWithCustomError(integrator, "LastOwner");
+        .to.be.revertedWithCustomError(integrator, "CannotRemoveSuperAdmin");
+    });
+
+    it("SUPER-ADMIN: unremovable + undemotable; handoff via transferSuperAdmin only", async function () {
+      // The super-admin is the deployer and is also an owner.
+      expect(await integrator.superAdmin()).to.equal(owner.address);
+      expect(await integrator.isOwner(owner.address)).to.equal(true);
+      // Cannot demote the super-admin via setRole.
+      await expect(integrator.connect(owner).setRole(owner.address, 0))
+        .to.be.revertedWithCustomError(integrator, "CannotRemoveSuperAdmin");
+      // Only the super-admin can hand off; others cannot.
+      await expect(integrator.connect(attacker).transferSuperAdmin(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(owner).transferSuperAdmin(ethers.ZeroAddress))
+        .to.be.revertedWithCustomError(integrator, "InvalidAddress");
+      await expect(integrator.connect(owner).transferSuperAdmin(owner.address))
+        .to.be.revertedWithCustomError(integrator, "InvalidAddress"); // no-op handoff
+      // Hand off to merchant2 → it becomes super-admin AND an owner; the previous
+      // super-admin stays an owner (not auto-evicted).
+      await expect(integrator.connect(owner).transferSuperAdmin(merchant2.address))
+        .to.emit(integrator, "SuperAdminTransferred").withArgs(owner.address, merchant2.address);
+      expect(await integrator.superAdmin()).to.equal(merchant2.address);
+      expect(await integrator.isOwner(merchant2.address)).to.equal(true);
+      expect(await integrator.isOwner(owner.address)).to.equal(true); // previous retained as owner
+      // The OLD super-admin can no longer manage roles/owners.
+      await expect(integrator.connect(owner).setRole(merchant1.address, 2))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      // The NEW super-admin can, and can now remove the old one as a plain owner.
+      await integrator.connect(merchant2).setRole(merchant1.address, 2);
+      expect(await integrator.roleOf(merchant1.address)).to.equal(2);
+      await integrator.connect(merchant2).removeOwner(owner.address);
+      expect(await integrator.isOwner(owner.address)).to.equal(false);
     });
 
     it("constructor rejects zero diamond/usdc; seeds extra owners", async function () {
@@ -982,22 +1045,59 @@ describe("MerchantTerminalIntegrator — registration, limits, settlement, withd
         .to.be.revertedWithCustomError(withVault, "MigrateStatePreconditions");
     });
 
-    it("migrateState is owner-only", async function () {
+    it("migrateState is super-admin-only (repointing/seeding custody is root-of-trust)", async function () {
       const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
       const next = await Integrator.deploy(
         await mockDiamond.getAddress(), await mockUsdc.getAddress(), await vault.getAddress(), []
       );
       await expect(next.connect(attacker).migrateState(await integrator.getAddress()))
-        .to.be.revertedWithCustomError(next, "OnlyOwner");
+        .to.be.revertedWithCustomError(next, "OnlySuperAdmin");
     });
 
-    it("flushToVault is owner-only and reverts if the vault is unset", async function () {
+    it("flushToVault is super-admin-only and reverts if the vault is unset", async function () {
       const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
       const ig = await Integrator.deploy(
         await mockDiamond.getAddress(), await mockUsdc.getAddress(), ethers.ZeroAddress, []
       );
       await expect(ig.flushToVault()).to.be.revertedWithCustomError(ig, "VaultNotSet");
-      await expect(ig.connect(attacker).flushToVault()).to.be.revertedWithCustomError(ig, "OnlyOwner");
+      await expect(ig.connect(attacker).flushToVault()).to.be.revertedWithCustomError(ig, "OnlySuperAdmin");
+    });
+
+    it("setVault is super-admin-only — rejects an attacker (root-of-trust custody pointer)", async function () {
+      await expect(integrator.connect(attacker).setVault(attacker.address))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+      await expect(integrator.connect(attacker).setVault(ethers.ZeroAddress))
+        .to.be.revertedWithCustomError(integrator, "OnlySuperAdmin");
+    });
+
+    it("constructor seeds superAdmin = deployer and emits SuperAdminTransferred(0, deployer)", async function () {
+      const Integrator = await ethers.getContractFactory("MerchantTerminalIntegrator");
+      const fresh = await Integrator.deploy(
+        await mockDiamond.getAddress(), await mockUsdc.getAddress(), ethers.ZeroAddress, []
+      );
+      // superAdmin is the deployer (the connected signer), who is also an owner.
+      expect(await fresh.superAdmin()).to.equal(owner.address);
+      expect(await fresh.isOwner(owner.address)).to.equal(true);
+      // The construction tx logs the initial handoff from address(0).
+      const ev = fresh.interface.getEvent("SuperAdminTransferred");
+      const logs = await ethers.provider.getLogs({
+        address: await fresh.getAddress(),
+        topics: [ev!.topicHash],
+        fromBlock: 0, toBlock: "latest",
+      });
+      const parsed = logs.map((l) => fresh.interface.parseLog(l)!);
+      const seed = parsed.find((p) => p.args.previous === ethers.ZeroAddress);
+      expect(seed, "constructor should emit SuperAdminTransferred(0, deployer)").to.not.equal(undefined);
+      expect(seed!.args.next).to.equal(owner.address);
+    });
+
+    it("super-admin cannot be re-roled to ANY tier (not just demoted to NONE)", async function () {
+      // The role-0 (demote) case is covered elsewhere; also block promoting/setting
+      // any non-zero tier on the super-admin (its access never comes from adminRole).
+      await expect(integrator.connect(owner).setRole(owner.address, 4))
+        .to.be.revertedWithCustomError(integrator, "CannotRemoveSuperAdmin");
+      await expect(integrator.connect(owner).setRole(owner.address, 2))
+        .to.be.revertedWithCustomError(integrator, "CannotRemoveSuperAdmin");
     });
   });
 

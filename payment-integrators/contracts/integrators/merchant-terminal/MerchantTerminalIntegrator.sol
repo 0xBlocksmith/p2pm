@@ -63,6 +63,11 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     // ─── Errors ───────────────────────────────────────────────────────
     error OnlyDiamond();
     error OnlyOwner();
+    /// @dev A super-admin-only action was called by someone who isn't the super-admin.
+    error OnlySuperAdmin();
+    /// @dev The super-admin is the single unremovable root of access control — it
+    ///      can be neither removed as an owner nor demoted below FINANCE by anyone.
+    error CannotRemoveSuperAdmin();
     /// @dev The last remaining owner can't be removed (never orphan the contract).
     error LastOwner();
     /// @dev The custody vault isn't set (or is zero) but a fund move was attempted.
@@ -135,6 +140,9 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
     event OwnerAdded(address indexed owner);
     event OwnerRemoved(address indexed owner);
+    /// @notice The super-admin (the single unremovable root of access control) was
+    ///         handed off from `previous` to `next`.
+    event SuperAdminTransferred(address indexed previous, address indexed next);
     event VaultSet(address indexed vault);
     /// @notice totalOwed was seeded from a prior integrator during a migration.
     event MigratedState(address indexed priorIntegrator, uint256 totalOwed);
@@ -155,6 +163,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         contract can't be orphaned). Sits ABOVE the 5-tier role system.
     mapping(address => bool) public isOwner;
     uint256 public ownerCount;
+    /// @notice THE SUPER-ADMIN: the single unremovable root of access control.
+    ///         It is always ALSO an owner (so it keeps full FINANCE-tier powers),
+    ///         but sits strictly above every owner: only the super-admin can add or
+    ///         remove owners and assign/revoke roles. Crucially, NO ONE can remove
+    ///         or demote the super-admin — not another owner, not itself via the
+    ///         owner path. The role only ever moves via `transferSuperAdmin`, an
+    ///         explicit self-initiated handoff. Seeded to the deployer at construction.
+    address public superAdmin;
     /// @notice The segregated custody vault holding ALL merchant USDC. The
     ///         integrator moves funds only via `vault.pull(...)` and reads
     ///         `vault.balance()` for solvency. Owner-settable so a migration can
@@ -309,6 +325,14 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         _;
     }
 
+    /// @dev Restricts an action to the single super-admin. Used for the root of
+    ///      access control: owner-set management (add/remove owners) and role
+    ///      assignment. Owners below the super-admin cannot perform these.
+    modifier onlySuperAdmin() {
+        if (msg.sender != superAdmin) revert OnlySuperAdmin();
+        _;
+    }
+
     /// @dev Any owner's EFFECTIVE tier is FINANCE (the top admin tier), so a
     ///      single hierarchy check covers both owners and any assigned admin.
     function _tier(address who) internal view returns (Role) {
@@ -363,8 +387,13 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         diamond = _diamond;
         usdc = IERC20(_usdc);
         vault = _vault;
-        // Seed the deployer + any extra owners (each with full access).
+        // Seed the deployer + any extra owners (each with full access). The
+        // deployer is ALSO the super-admin — the single unremovable root that
+        // alone manages the owner set and role assignments. Hand it off later
+        // via transferSuperAdmin (e.g. to a multisig) once deployment settles.
         _addOwner(msg.sender);
+        superAdmin = msg.sender;
+        emit SuperAdminTransferred(address(0), msg.sender);
         for (uint256 i = 0; i < _owners.length; i++) {
             if (_owners[i] != address(0) && !isOwner[_owners[i]]) _addOwner(_owners[i]);
         }
@@ -546,7 +575,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         address user,
         uint256 amount,
         address /* recipientAddr */
-    ) external onlyDiamond {
+    ) external onlyDiamond nonReentrant {
         // recipientAddr = the merchant's proxy (usdcThroughIntegrator =
         // false): the Diamond just sent USDC there. Pull it into this integrator,
         // then forward it into the VAULT (custody), where it sits until the
@@ -564,7 +593,7 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         validateOrder. Tolerates unknown orderIds; deletes the
     ///         orderToMerchant entry so a repeated cancellation cannot
     ///         double-decrement.
-    function onOrderCancel(uint256 orderId) external onlyDiamond {
+    function onOrderCancel(uint256 orderId) external onlyDiamond nonReentrant {
         address merchant = orderToMerchant[orderId];
         if (merchant == address(0)) return; // SELL or unknown — nothing to release
         Merchant storage m = merchants[merchant];
@@ -988,15 +1017,20 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     // ─── Admin ────────────────────────────────────────────────────────
 
-    /// @notice OWNER-ONLY: assign an admin's role tier. This is the single entry
-    ///         point for role-based access. Roles are hierarchical — a higher tier
-    ///         includes every lower tier's powers. Pass Role.NONE to revoke. Keeps
-    ///         the legacy `admins` bool in sync (true for any non-NONE role) so
-    ///         isAdmin / existing integrations keep working. No redeploy needed.
+    /// @notice SUPER-ADMIN-ONLY: assign an admin's role tier. This is the single
+    ///         entry point for role-based access. Roles are hierarchical — a higher
+    ///         tier includes every lower tier's powers. Pass Role.NONE to revoke.
+    ///         Keeps the legacy `admins` bool in sync (true for any non-NONE role)
+    ///         so isAdmin / existing integrations keep working. No redeploy needed.
+    ///         Only the super-admin (not other owners) may assign roles.
     /// @param who  The admin wallet.
     /// @param role 0=NONE(revoke) 1=VIEWER 2=SUPPORT 3=MANAGER 4=FINANCE.
-    function setRole(address who, Role role) public onlyOwner {
+    function setRole(address who, Role role) public onlySuperAdmin {
         if (who == address(0)) revert InvalidAddress();
+        // The super-admin's own tier is FINANCE-by-virtue-of-superAdmin and can
+        // never be lowered — refuse any attempt to set a role on the super-admin
+        // (its access does not come from adminRole and must stay untouchable).
+        if (who == superAdmin) revert CannotRemoveSuperAdmin();
         bool wasAdmin = adminRole[who] != Role.NONE;
         adminRole[who] = role;
         admins[who] = role != Role.NONE;
@@ -1006,36 +1040,57 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
         if (role == Role.NONE && wasAdmin) emit AdminRemoved(who);
     }
 
-    /// @notice OWNER-ONLY: add an admin. Back-compat shim — grants FINANCE (the
-    ///         full admin tier, matching the previous flat-admin behaviour where a
-    ///         single admin could do everything). Use setRole(who, <tier>) for a
-    ///         narrower role (e.g. Role.SUPPORT for freeze-only, Role.VIEWER for
-    ///         read-only).
-    function addAdmin(address who) external onlyOwner {
+    /// @notice SUPER-ADMIN-ONLY: add an admin. Back-compat shim — grants FINANCE
+    ///         (the full admin tier, matching the previous flat-admin behaviour
+    ///         where a single admin could do everything). Use setRole(who, <tier>)
+    ///         for a narrower role (e.g. Role.SUPPORT for freeze-only, Role.VIEWER
+    ///         for read-only).
+    function addAdmin(address who) external onlySuperAdmin {
         setRole(who, Role.FINANCE);
     }
 
-    /// @notice OWNER-ONLY: remove an admin (revoke all roles).
-    function removeAdmin(address who) external onlyOwner {
+    /// @notice SUPER-ADMIN-ONLY: remove an admin (revoke all roles).
+    function removeAdmin(address who) external onlySuperAdmin {
         setRole(who, Role.NONE);
     }
 
-    /// @notice OWNER-ONLY: add another main owner (full access). Any owner can add.
-    function addOwner(address who) external onlyOwner {
+    /// @notice SUPER-ADMIN-ONLY: add another main owner (full access). Only the
+    ///         super-admin may grow the owner set — a regular owner cannot add or
+    ///         remove owners.
+    function addOwner(address who) external onlySuperAdmin {
         if (who == address(0)) revert InvalidAddress();
         if (isOwner[who]) revert AlreadyRegistered();
         _addOwner(who);
     }
 
-    /// @notice OWNER-ONLY: remove an owner. The LAST owner can never be removed, so
-    ///         the contract is never left without an owner. An owner can remove
-    ///         themselves as long as another remains.
-    function removeOwner(address who) external onlyOwner {
+    /// @notice SUPER-ADMIN-ONLY: remove an owner. The super-admin can NEVER be
+    ///         removed (CannotRemoveSuperAdmin), and the LAST owner can never be
+    ///         removed either (the contract is never orphaned). Only the super-admin
+    ///         may remove owners.
+    function removeOwner(address who) external onlySuperAdmin {
         if (!isOwner[who]) revert InvalidAddress();
+        // The super-admin is unremovable by anyone, including via the owner path.
+        if (who == superAdmin) revert CannotRemoveSuperAdmin();
         if (ownerCount == 1) revert LastOwner();
         isOwner[who] = false;
         ownerCount--;
         emit OwnerRemoved(who);
+    }
+
+    /// @notice SUPER-ADMIN-ONLY: hand off the super-admin role to `next`. This is
+    ///         the ONLY way the super-admin ever changes — there is no removal
+    ///         path. `next` becomes an owner if it isn't already (so it keeps full
+    ///         powers), and the PREVIOUS super-admin REMAINS an owner (it is not
+    ///         auto-evicted; the new super-admin can removeOwner(previous) later if
+    ///         desired). Use this to move root control to a multisig after deploy.
+    /// @param next The new super-admin. Must be non-zero and not the current one.
+    function transferSuperAdmin(address next) external onlySuperAdmin {
+        if (next == address(0)) revert InvalidAddress();
+        if (next == superAdmin) revert InvalidAddress(); // no-op handoff
+        if (!isOwner[next]) _addOwner(next); // the super-admin is always an owner
+        address prev = superAdmin;
+        superAdmin = next;
+        emit SuperAdminTransferred(prev, next);
     }
 
     function _addOwner(address who) internal {
@@ -1080,47 +1135,56 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
 
     /// @notice Back-compat: transferOwnership now means "add the new owner and drop
     ///         the caller" (a 1→1 handoff). With multi-owner, prefer addOwner /
-    ///         removeOwner. Reverts on the zero address.
-    function transferOwnership(address newOwner) external onlyOwner {
+    ///         removeOwner. Super-admin-only (it mutates the owner set), and it can
+    ///         NEVER drop the super-admin — the super-admin must always stay an
+    ///         owner. To move ROOT control, use transferSuperAdmin instead.
+    function transferOwnership(address newOwner) external onlySuperAdmin {
         if (newOwner == address(0)) revert InvalidAddress();
         // Guard the self-transfer foot-gun: transferOwnership(self) would fall
         // through to the drop-caller branch below and silently REMOVE the caller
         // (a pure self-eviction, not a handoff). A handoff to yourself is a no-op
         // by intent, so reject it explicitly rather than strip ownership.
         if (newOwner == msg.sender) revert InvalidAddress();
+        // The caller is the super-admin (onlySuperAdmin), who must ALWAYS remain an
+        // owner — dropping it below would leave the super-admin not-an-owner (it
+        // would lose FINANCE-tier owner powers while still gating governance). So
+        // add the new owner but do NOT evict the super-admin caller. Root handoff
+        // is transferSuperAdmin's job, not this shim's.
         if (!isOwner[newOwner]) _addOwner(newOwner);
-        if (ownerCount > 1) { isOwner[msg.sender] = false; ownerCount--; emit OwnerRemoved(msg.sender); }
         emit OwnershipTransferred(msg.sender, newOwner);
     }
 
-    /// @notice OWNER-ONLY: point the integrator at the custody vault. Needed so a
-    ///         migration can wire a fresh integrator to the existing vault. After
+    /// @notice SUPER-ADMIN-ONLY: point the integrator at the custody vault.
+    ///         Repointing custody is a root-of-trust action (every _vaultPull
+    ///         flows through `vault`), so it is restricted to the super-admin, not
+    ///         every owner. Needed so a migration can wire a fresh integrator to
+    ///         the existing vault. After
     ///         this, the vault side must separately authorise this integrator via
     ///         vault.setIntegrator — which now REQUIRES this integrator's `vault`
     ///         to already equal that vault (the mutual handshake). So the correct
     ///         wiring order is: setVault(theVault) here, THEN vault.setIntegrator(
     ///         thisIntegrator) — the handshake makes an asymmetric link impossible.
-    function setVault(address v) external onlyOwner {
+    function setVault(address v) external onlySuperAdmin {
         if (v == address(0)) revert InvalidAddress();
         vault = v;
         emit VaultSet(v);
     }
 
-    /// @notice OWNER-ONLY, ONE-SHOT: forward any USDC transiently held on this
+    /// @notice SUPER-ADMIN-ONLY, ONE-SHOT: forward any USDC transiently held on this
     ///         integrator into the vault. Only relevant after an integrator-first
     ///         deploy where a BUY completed before setVault was wired (the deposit
     ///         was credited and the USDC parked here — see _toVault). Once the
     ///         vault is set, call this to move the parked balance into custody so
     ///         vault.balance() once again covers totalOwed. A harmless no-op when
     ///         nothing is held.
-    function flushToVault() external onlyOwner {
+    function flushToVault() external onlySuperAdmin {
         if (vault == address(0)) revert VaultNotSet();
         uint256 held = usdc.balanceOf(address(this));
         if (held > 0) usdc.safeTransfer(vault, held);
         emit FlushedToVault(held);
     }
 
-    /// @notice OWNER-ONLY, ONE-SHOT: seed this integrator's totalOwed from a PRIOR
+    /// @notice SUPER-ADMIN-ONLY, ONE-SHOT: seed this integrator's totalOwed from a PRIOR
     ///         integrator when migrating onto a shared vault. The vault holds all
     ///         USDC and is repointed to a fresh integrator on migration; but
     ///         totalOwed (the accounting) lives in the integrator, so a fresh one
@@ -1138,12 +1202,17 @@ contract MerchantTerminalIntegrator is IP2PIntegrator {
     ///         One-shot (stateMigrated guard) and only callable before any local
     ///         accounting exists (totalOwed must be 0), so it can never corrupt a
     ///         live ledger.
-    function migrateState(address priorIntegrator) external onlyOwner {
+    function migrateState(address priorIntegrator) external onlySuperAdmin {
         if (stateMigrated) revert AlreadyMigrated();
         if (priorIntegrator == address(0) || vault == address(0) || totalOwed != 0)
             revert MigrateStatePreconditions();
         stateMigrated = true;
         uint256 prior = IPriorIntegrator(priorIntegrator).totalOwed();
+        // Sanity guard against a wrong-prior fat-finger: the seeded aggregate can
+        // never exceed the custody actually adopted, or the solvency invariant
+        // (vault.balance() >= totalOwed) would be born already violated. The vault
+        // should be quiesced (locked / repointed) before this cutover.
+        if (prior > IPayQRVault(vault).balance()) revert MigrateStatePreconditions();
         totalOwed = prior;
         emit MigratedState(priorIntegrator, prior);
     }

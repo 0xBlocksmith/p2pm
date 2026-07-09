@@ -39,16 +39,30 @@ interface IIntegratorLink {
  *             onlyIntegrator + whenNotLocked + nonReentrant. No arbitrary call, no
  *             approve to third parties, no pullFrom.
  *
- *         MULTI-OWNER governance: a SET of owners, each with full access (add/remove
- *         owners, set the integrator, lock/unlock). The deployer is the first owner;
- *         additional owners can be seeded at construction and managed later. The
- *         last owner can never be removed (so the vault can't be orphaned).
+ *         GOVERNANCE (super-admin + owners):
+ *           • SUPER-ADMIN: the single unremovable root. The ONLY address that can
+ *             add/remove owners or repoint the integrator (setIntegrator). It can
+ *             never be removed/demoted; it moves only via transferSuperAdmin
+ *             (one-way handoff). Seeded to the deployer.
+ *           • OWNERS: a set with full OPERATIONAL access — crucially the kill-switch
+ *             lock()/unlock() is open to EVERY owner so the break-glass is fast and
+ *             never bottlenecked on one key. Owners cannot change the owner set or
+ *             the integrator link (that is the super-admin's alone).
+ *           • The last owner can never be removed and the super-admin is always an
+ *             owner, so the vault can never be orphaned.
  */
 contract PayQRVault {
     using SafeERC20 for IERC20;
 
     // ─── Errors ───────────────────────────────────────────────────────
     error NotOwner();
+    /// @dev A super-admin-only action (owner-set / integrator management) was
+    ///      called by someone who isn't the super-admin.
+    error OnlySuperAdmin();
+    /// @dev The super-admin is the single unremovable root of vault governance —
+    ///      it can neither be removed as an owner nor handed off except via
+    ///      transferSuperAdmin.
+    error CannotRemoveSuperAdmin();
     error NotIntegrator();
     error VaultLocked();
     error BadPull();
@@ -67,6 +81,9 @@ contract PayQRVault {
     event Unlocked(address indexed by);
     event OwnerAdded(address indexed owner);
     event OwnerRemoved(address indexed owner);
+    /// @notice The super-admin (single unremovable root of vault governance) was
+    ///         handed off from `previous` to `next`.
+    event SuperAdminTransferred(address indexed previous, address indexed next);
 
     // ─── State ────────────────────────────────────────────────────────
     /// @notice The custodied token (USDC). Immutable.
@@ -76,9 +93,21 @@ contract PayQRVault {
     address public integrator;
     /// @notice Break-glass: when true, ALL pulls revert. Owners flip it.
     bool public locked;
-    /// @notice Multi-owner set — each owner has full governance access.
+    /// @notice Multi-owner set. Each owner can operate the kill-switch
+    ///         (lock/unlock) — the emergency stop is deliberately broad and fast.
+    ///         Owner-SET changes and integrator repointing are the super-admin's
+    ///         alone (see below).
     mapping(address => bool) public isOwner;
     uint256 public ownerCount;
+    /// @notice THE SUPER-ADMIN: the single unremovable root of vault governance.
+    ///         Always ALSO an owner. It is the ONLY address that can add/remove
+    ///         owners or repoint the integrator (setIntegrator = the migration /
+    ///         custody-authorisation primitive). NO ONE can remove or demote it;
+    ///         it only ever moves via `transferSuperAdmin` (an explicit one-way
+    ///         handoff, e.g. to a multisig). Seeded to the deployer at construction.
+    ///         NOTE: lock()/unlock() stay open to EVERY owner so the break-glass is
+    ///         never bottlenecked on one key.
+    address public superAdmin;
 
     // ─── Reentrancy guard ─────────────────────────────────────────────
     uint256 private _locked = 1;
@@ -92,6 +121,11 @@ contract PayQRVault {
     // ─── Access ───────────────────────────────────────────────────────
     modifier onlyOwner() {
         if (!isOwner[msg.sender]) revert NotOwner();
+        _;
+    }
+    /// @dev Restricts owner-set + integrator management to the single super-admin.
+    modifier onlySuperAdmin() {
+        if (msg.sender != superAdmin) revert OnlySuperAdmin();
         _;
     }
     modifier onlyIntegrator() {
@@ -111,8 +145,12 @@ contract PayQRVault {
     constructor(address _usdc, address[] memory _owners) {
         if (_usdc == address(0)) revert InvalidAddress();
         usdc = IERC20(_usdc);
-        // Seed the deployer as an owner.
+        // Seed the deployer as an owner AND the super-admin — the single
+        // unremovable root that alone manages the owner set and the integrator
+        // link. Hand it off later via transferSuperAdmin (e.g. to a multisig).
         _addOwner(msg.sender);
+        superAdmin = msg.sender;
+        emit SuperAdminTransferred(address(0), msg.sender);
         for (uint256 i = 0; i < _owners.length; i++) {
             if (_owners[i] != address(0) && !isOwner[_owners[i]]) _addOwner(_owners[i]);
         }
@@ -147,7 +185,7 @@ contract PayQRVault {
      *      value) and the new one is live — the switch is atomic in one tx.
      *      address(0) skips the check (it only disables pulls, authorises nothing).
      */
-    function setIntegrator(address next) external onlyOwner {
+    function setIntegrator(address next) external onlySuperAdmin {
         if (next != address(0) && IIntegratorLink(next).vault() != address(this)) {
             revert LinkMismatch();
         }
@@ -168,18 +206,35 @@ contract PayQRVault {
         emit Unlocked(msg.sender);
     }
 
-    // ─── Multi-owner management ───────────────────────────────────────
-    function addOwner(address who) external onlyOwner {
+    // ─── Multi-owner management (super-admin only) ────────────────────
+    /// @notice SUPER-ADMIN-ONLY: add a full-access owner.
+    function addOwner(address who) external onlySuperAdmin {
         if (who == address(0)) revert InvalidAddress();
         if (isOwner[who]) revert AlreadySet();
         _addOwner(who);
     }
-    function removeOwner(address who) external onlyOwner {
+    /// @notice SUPER-ADMIN-ONLY: remove an owner. The super-admin can NEVER be
+    ///         removed (CannotRemoveSuperAdmin), and the last owner is never
+    ///         removable (the vault is never orphaned).
+    function removeOwner(address who) external onlySuperAdmin {
         if (!isOwner[who]) revert InvalidAddress();
+        if (who == superAdmin) revert CannotRemoveSuperAdmin();
         if (ownerCount == 1) revert LastOwner(); // never orphan the vault
         isOwner[who] = false;
         ownerCount--;
         emit OwnerRemoved(who);
+    }
+    /// @notice SUPER-ADMIN-ONLY: hand off the super-admin root to `next` (one-way).
+    ///         `next` becomes an owner if it isn't already, so the root is always an
+    ///         owner; the previous super-admin stays an owner (not auto-evicted).
+    ///         Use this to move root control to a multisig after deploy.
+    function transferSuperAdmin(address next) external onlySuperAdmin {
+        if (next == address(0)) revert InvalidAddress();
+        if (next == superAdmin) revert InvalidAddress(); // no-op handoff
+        if (!isOwner[next]) _addOwner(next);
+        address prev = superAdmin;
+        superAdmin = next;
+        emit SuperAdminTransferred(prev, next);
     }
     function _addOwner(address who) internal {
         isOwner[who] = true;

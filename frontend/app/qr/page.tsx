@@ -439,6 +439,7 @@ export default function PosQr() {
             <CheckoutWidget
               orderId={liveWidget.resumeOrderId}
               usdcAmount={liveWidget.usdcAmount}
+              creditedUsdc={BigInt(Math.round((liveWidget.usdc ?? 0) * 1e6))}
               quantity={liveWidget.quantity}
               productName={shopLabel || "PayQR sale"}
               currencies={[{

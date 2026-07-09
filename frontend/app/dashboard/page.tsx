@@ -13,7 +13,7 @@ import { WalletSheet } from "../../components/WalletSheet";
 import { CONTRACT_ADDRESS, INTEGRATOR_ABI, fmtUsdc } from "../../lib/contract";
 import { STATIC_STALE_MS } from "../../lib/cache";
 import { fetchOnchainSellPrice } from "../../lib/price";
-import { fetchHistory } from "../../lib/history";
+import { fetchHistory, fetchWithdrawals } from "../../lib/history";
 import { loadCountry, fmtFiat } from "../../lib/countries";
 import { useT } from "../../lib/i18n";
 
@@ -97,6 +97,14 @@ export default function Dashboard() {
     return () => clearInterval(t);
   }, []);
 
+  // The merchant's per-merchant proxy — fiat withdrawals (SELL orders) are
+  // indexed in the subgraph under THIS address, so we read it to fetch them
+  // and fold them into the recent-activity list (same as the Transactions page).
+  const { data: proxyAddr } = useReadContract({
+    address: CONTRACT_ADDRESS, abi: INTEGRATOR_ABI, functionName: "proxyAddress",
+    args: [address], query: { enabled: !!address },
+  });
+
   useEffect(() => {
     if (!country?.code) return;
     let on = true;
@@ -114,11 +122,25 @@ export default function Dashboard() {
   useEffect(() => {
     if (!address) return;
     let on = true;
-    const load = () => fetchHistory(address).then((h) => on && setRows(h)).catch(() => {});
+    // Payments (BUY orders, keyed by merchant) + fiat withdrawals (SELL orders,
+    // keyed by the merchant's proxy). Merge into one recent-activity timeline —
+    // the same combined view the Transactions page shows.
+    const load = () =>
+      Promise.all([
+        fetchHistory(address),
+        proxyAddr ? fetchWithdrawals(proxyAddr) : Promise.resolve([]),
+      ])
+        .then(([payments, withdrawals]) => {
+          if (!on) return;
+          const merged = [...payments.map((r) => ({ ...r, kind: "payment" })), ...withdrawals]
+            .sort((a, b) => b.placedAt - a.placedAt);
+          setRows(merged);
+        })
+        .catch(() => {});
     load();
     const t = setInterval(load, 15000);
     return () => { on = false; clearInterval(t); };
-  }, [address]);
+  }, [address, proxyAddr]);
 
   const [pending, available, , isFrozen] = balance ?? [0n, 0n, 0n, false];
   const [used, limit] = daily ?? [0n, 25n];
@@ -350,6 +372,8 @@ export default function Dashboard() {
         ) : (
           <div className="recent-list">
             {recent.map((tx) => {
+              // money OUT (withdrawal / SELL) vs money IN (payment / BUY).
+              const isWithdraw = tx.kind === "withdraw";
               const settled = tx.status === "settled";
               const cancelled = tx.status === "cancelled";
               // "matching" = accepted but still settling (locked ~10 min). Show
@@ -357,29 +381,32 @@ export default function Dashboard() {
               const settling = tx.status === "matching";
               const usdc = Number(tx.amount) / 1e6;
               const fiat = rate && country ? usdc * rate.rate : null;
-              const label = settled
-                ? t("dash.received")
-                : cancelled
-                  ? t("dash.cancelled")
-                  : t("dash.lockedSettling");
+              const label = isWithdraw
+                ? t("tx.withdrew")
+                : settled
+                  ? t("dash.received")
+                  : cancelled
+                    ? t("dash.cancelled")
+                    : t("dash.lockedSettling");
               return (
-                <div key={tx.orderId} className="recent-row">
-                  <span className={`rr-ico ${settled ? "in" : settling ? "wait" : "pend"}`}>
-                    {cancelled ? <Icon.Back /> : <Icon.Down />}
+                <div key={`${tx.kind || "payment"}-${tx.orderId}`} className="recent-row">
+                  <span className={`rr-ico ${isWithdraw ? "out" : settled ? "in" : settling ? "wait" : "pend"}`}>
+                    {isWithdraw ? <Icon.Up /> : cancelled ? <Icon.Back /> : <Icon.Down />}
                   </span>
                   <div className="rr-mid">
                     {/* FIAT is the headline (what the shopkeeper thinks in), with the
                         USDC + order id as the secondary line — matches the requested
-                        "₹3,890 / 42.61 USDC · #333" layout. */}
+                        "₹3,890 / 42.61 USDC · #333" layout. Withdrawals read as money
+                        leaving (−), settled sales as money arriving (+). */}
                     <div className="rr-amt">
-                      {settled ? "+ " : ""}
+                      {isWithdraw ? "− " : settled ? "+ " : ""}
                       {fiat != null ? fmtFiat(country, fiat) : `${fmtUsdc(tx.amount)} USDC`}
                     </div>
                     <div className="rr-sub">
                       {fmtUsdc(tx.amount)} USDC · #{tx.orderId} · {timeAgo(tx.createdAt)}
                     </div>
                   </div>
-                  <span className={`rr-status ${settled ? "ok" : cancelled ? "bad" : "wait"}`}>
+                  <span className={`rr-status ${isWithdraw ? "out" : settled ? "ok" : cancelled ? "bad" : "wait"}`}>
                     {label}
                   </span>
                 </div>

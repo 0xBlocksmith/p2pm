@@ -21,7 +21,13 @@ import { Icon } from "./Icons";
  *   orderId     string — when set, the widget skips placeOrder and tracks an
  *               already-placed order instead (resuming a payment the merchant
  *               reopened this dialog for)
- *   usdcAmount  bigint (6-dec) — what the merchant is charging
+ *   usdcAmount  bigint (6-dec) — the GROSS order amount the customer's fiat buys.
+ *               Drives the on-chain order + the widget's fiat breakdown, so the
+ *               customer pays exactly the merchant's entered fiat.
+ *   creditedUsdc bigint (6-dec, optional) — the NET USDC that lands in the
+ *               merchant's wallet after the small-order fee. Shown as the headline
+ *               "X USDC" so both the Accept page and the widget display what the
+ *               merchant KEEPS. Falls back to usdcAmount when not supplied.
  *   quantity    bigint — product-2 units (6-dec USDC units) for our userPlaceOrder
  *   productName string
  *   onComplete  (orderId) => void
@@ -30,6 +36,7 @@ import { Icon } from "./Icons";
 type CheckoutWidgetProps = {
   orderId?: string;
   usdcAmount: bigint;
+  creditedUsdc?: bigint;
   quantity: bigint;
   productName?: string;
   currencies?: any[];
@@ -40,7 +47,7 @@ type CheckoutWidgetProps = {
   onError?: (msg: string) => void;
 };
 
-export function CheckoutWidget({ orderId, usdcAmount, quantity, productName, currencies, onPlaced, onComplete, onCancel, onClose, onError }: CheckoutWidgetProps) {
+export function CheckoutWidget({ orderId, usdcAmount, creditedUsdc, quantity, productName, currencies, onPlaced, onComplete, onCancel, onClose, onError }: CheckoutWidgetProps) {
   const { signer, publicClient, ready } = useCheckoutSigner();
   const { getIdentity, syncToSdkStore } = useRelayIdentity();
   const [err, setErr] = useState("");
@@ -82,7 +89,11 @@ export function CheckoutWidget({ orderId, usdcAmount, quantity, productName, cur
         diamondAddress={(DIAMOND_ADDRESS || undefined) as `0x${string}` | undefined}
         currencies={currencies && currencies.length ? currencies : CURRENCIES}
         productName={productName}
-        amount={`${(Number(usdcAmount) / 1e6).toFixed(2)} USDC`}
+        // Headline shows the NET amount that lands in the merchant's wallet (after
+        // the small-order fee), matching the Accept page's "you keep" figure. The
+        // on-chain order + fiat breakdown still use the GROSS usdcAmount below, so
+        // the customer pays exactly the entered fiat.
+        amount={`${(Number(creditedUsdc ?? usdcAmount) / 1e6).toFixed(2)} USDC`}
         subgraphUrl={SUBGRAPH_URL}
         usdcAddress={(USDC_ADDRESS || undefined) as `0x${string}` | undefined}
         usdcAmount={usdcAmount}

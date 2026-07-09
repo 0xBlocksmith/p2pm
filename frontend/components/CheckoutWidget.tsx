@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Checkout } from "@p2pdotme/widgets/checkout";
 import { useCheckoutSigner } from "./useCheckoutSigner";
 import { useRelayIdentity } from "./useRelayIdentity";
@@ -12,6 +12,9 @@ import { ACTIVE_CHAIN } from "../lib/chain";
  * relay identity (user pubkey), auto-resolves the INR circle through the
  * subgraph, and drives the place → accept → pay → complete flow. We supply the
  * placeOrder callback that calls OUR integrator's userPlaceOrder.
+ *
+ * The caller (qr page) only mounts this AFTER confirming an LP is assignable
+ * (isPaymentPartnerAvailable), so placement won't fail with "no payment partner".
  *
  * Props:
  *   usdcAmount  bigint (6-dec) — what the merchant is charging
@@ -34,10 +37,25 @@ type CheckoutWidgetProps = {
 
 export function CheckoutWidget({ usdcAmount, quantity, productName, currencies, onPlaced, onComplete, onCancel, onClose, onError }: CheckoutWidgetProps) {
   const { signer, publicClient, ready } = useCheckoutSigner();
-  const { getIdentity } = useRelayIdentity();
+  const { getIdentity, syncToSdkStore } = useRelayIdentity();
   const [err, setErr] = useState("");
+  // The widget DECRYPTS the LP's payout handle with the SDK's global relay-identity
+  // slot, but we PLACE the order with our per-address key. Mirror ours into the
+  // global slot BEFORE the widget mounts so both sides use the same key — otherwise
+  // decryption fails and the widget shows "Session changed" in the PIX/UPI field.
+  // Gate the render on this so the widget's first decrypt reads the synced key.
+  const [identityReady, setIdentityReady] = useState(false);
 
-  if (!ready) {
+  useEffect(() => {
+    if (!ready) return;
+    let alive = true;
+    syncToSdkStore()
+      .then(() => { if (alive) setIdentityReady(true); })
+      .catch(() => { if (alive) setIdentityReady(true); }); // don't block checkout on a sync hiccup
+    return () => { alive = false; };
+  }, [ready, syncToSdkStore]);
+
+  if (!ready || !identityReady) {
     return <p className="muted">Preparing wallet…</p>;
   }
 

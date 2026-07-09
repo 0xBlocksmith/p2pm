@@ -9,8 +9,9 @@
  *
  * Docs: github.com/p2pdotme/widgets
  */
-import { encodeFunctionData, stringToHex } from "viem";
+import { encodeFunctionData, stringToHex, createPublicClient, http } from "viem";
 import { INTEGRATOR_ABI, CONTRACT_ADDRESS, CLIENT_ADDRESS, PRODUCT_ID } from "./contract";
+import { ACTIVE_CHAIN, RPC_URL } from "./chain";
 
 // The team's Base Sepolia subgraph — enables automatic circle selection.
 export const SUBGRAPH_URL =
@@ -22,10 +23,6 @@ export const DIAMOND_ADDRESS = process.env.NEXT_PUBLIC_DIAMOND_ADDRESS || "";
 
 // INR via UPI, circleId omitted → resolved by the widget through the subgraph.
 export const CURRENCIES = [{ symbol: "INR", flag: "🇮🇳", paymentMethod: "UPI", symbolNative: "₹" }];
-
-// bytes32("INR") as the subgraph stores currency.
-const INR_HEX =
-  "0x494e520000000000000000000000000000000000000000000000000000000000";
 
 // ── Generic currency ⇄ bytes32 (no per-country hardcoding) ──────────
 // The subgraph stores a currency as a left-aligned bytes32 of the ASCII code.
@@ -86,11 +83,76 @@ export async function resolveCircleId(code: string): Promise<bigint | null> {
   return list.find((c) => c.code === code)?.circleId ?? null;
 }
 
+// ── LP-availability pre-flight ──────────────────────────────────────
+// The widget's router will refuse to place an order ("No payment partner
+// available" / ROUTING_NO_MERCHANTS) whenever the currency's circle has no
+// merchant assignable to THIS buyer+amount at that instant. On testnet each
+// circle has a single LP whose availability flickers, so a checkout opened
+// during a gap fails at placement. We predict that EXACT condition up front by
+// calling the same on-chain view the router calls (getAssignableMerchantsFromCircle),
+// and only open the widget once ≥1 LP is assignable — so the merchant never sees
+// a failed placement, and we don't paper over it with blind retries.
+const ORDER_FLOW_ABI = [
+  {
+    name: "getAssignableMerchantsFromCircle",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "circleId", type: "uint256" },
+      { name: "assignUpto", type: "uint256" },
+      { name: "currency", type: "bytes32" },
+      { name: "user", type: "address" },
+      { name: "usdtAmount", type: "uint256" },
+      { name: "fiatAmount", type: "uint256" },
+      { name: "orderType", type: "int256" },
+      { name: "preferredPCConfigId", type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "address[]" }],
+  },
+] as const;
+
+let _rc: { readContract: (args: any) => Promise<any> } | null = null;
+function readClient() {
+  if (!_rc) {
+    _rc = createPublicClient({
+      chain: ACTIVE_CHAIN as any,
+      transport: http(RPC_URL || undefined),
+    }) as unknown as { readContract: (args: any) => Promise<any> };
+  }
+  return _rc;
+}
+
 /**
- * INR-specific shim (kept for callers that still use it). Prefer resolveCircleId.
+ * Is at least one LP assignable to fill a BUY order for `code` right now, for
+ * this buyer + these amounts? Mirrors the widget router's on-chain eligibility
+ * check exactly, so a `true` here means the widget WILL find a partner.
+ *
+ * @param code      currency code ("INR", "BRL", …)
+ * @param user      the buyer address (the merchant's smart account)
+ * @param usdcAmount 6-dec USDC the order is for
+ * @param fiatAmount 6-dec fiat the order is for
+ * Returns false on any read error (treated as "not available yet").
  */
-export async function resolveInrCircleId() {
-  return (await resolveCircleId("INR")) ?? 1n;
+export async function isPaymentPartnerAvailable(
+  code: string,
+  user: string,
+  usdcAmount: bigint,
+  fiatAmount: bigint,
+): Promise<boolean> {
+  try {
+    const circleId = await resolveCircleId(code);
+    if (circleId == null) return false;
+    const merchants = (await readClient().readContract({
+      address: DIAMOND_ADDRESS as `0x${string}`,
+      abi: ORDER_FLOW_ABI,
+      functionName: "getAssignableMerchantsFromCircle",
+      // assignUpto 5 mirrors the SDK's default fan-out; orderType 0 = BUY.
+      args: [circleId, 5n, codeToHex(code), user, usdcAmount, fiatAmount, 0n, 0n],
+    })) as string[];
+    return Array.isArray(merchants) && merchants.length >= 1;
+  } catch {
+    return false;
+  }
 }
 
 /**

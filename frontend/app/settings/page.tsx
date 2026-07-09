@@ -10,7 +10,7 @@ import { useMerchant } from "../../components/useMerchant";
 import { useSmartAccount } from "../../components/useSmartAccount";
 import { useRelayIdentity } from "../../components/useRelayIdentity";
 import { Icon } from "../../components/Icons";
-import { CONTRACT_ADDRESS, INTEGRATOR_ABI } from "../../lib/contract";
+import { CONTRACT_ADDRESS, INTEGRATOR_ABI, currencyFromBytes32 } from "../../lib/contract";
 import { encryptPayout, decryptPayout } from "../../lib/payoutCrypto";
 import {
   COUNTRIES, LANGUAGES, loadCountry, loadLang, saveCountry, saveLang, clearLocalUserData,
@@ -46,6 +46,14 @@ export default function Settings() {
   });
   const encPayout = info?.[0] || "";   // on-chain ciphertext blob (bytes)
   const shopName = info?.[1] || "";
+  // The merchant's REGISTERED offramp currency is LOCKED on-chain at registration
+  // (getMerchantInfo[2]). Payout validation + the "can't be changed" note MUST key
+  // off THIS, not the freely-editable UI `country` — otherwise an INR merchant who
+  // switches the UI country to Brazil could save a PIX-shaped handle into their INR
+  // profile (wrong validator) and would see a wrong "Currency (BRL)…" note.
+  const registeredCode = currencyFromBytes32(info?.[2] as string);
+  const payoutCountry =
+    (registeredCode && COUNTRIES.find((c) => c.code === registeredCode)) || country;
 
   // Decrypt the payout handle for display (client-side, with the merchant's own
   // relay key). null when it can't be decrypted on this device (a different relay
@@ -77,9 +85,10 @@ export default function Settings() {
   async function saveProfile() {
     setProfileMsg("");
     if (!edShop.trim()) return setProfileMsg("Enter a shop name.");
-    if (!edPayout.trim()) return setProfileMsg(`Enter your ${country.payoutLabel}.`);
-    if (country.validatePayout && !country.validatePayout(edPayout.trim())) {
-      return setProfileMsg(`Enter a valid ${country.payoutLabel} (like ${country.payoutPlaceholder}).`);
+    // Validate against the REGISTERED currency (payoutCountry), not the UI country.
+    if (!edPayout.trim()) return setProfileMsg(`Enter your ${payoutCountry.payoutLabel}.`);
+    if (payoutCountry.validatePayout && !payoutCountry.validatePayout(edPayout.trim())) {
+      return setProfileMsg(`Enter a valid ${payoutCountry.payoutLabel} (like ${payoutCountry.payoutPlaceholder}).`);
     }
     if (!sendTransaction) return setProfileMsg("Wallet still connecting — try again in a moment.");
     setSavingProfile(true);
@@ -139,11 +148,11 @@ export default function Settings() {
               <label className="set-k" style={{ display: "block", marginTop: 6 }}>{t("set.shopName")}</label>
               <input className="input" value={edShop} onChange={(e) => setEdShop(e.target.value)}
                 placeholder="Your shop name" />
-              <label className="set-k" style={{ display: "block", marginTop: 10 }}>{country.payoutLabel}</label>
+              <label className="set-k" style={{ display: "block", marginTop: 10 }}>{payoutCountry.payoutLabel}</label>
               <input className="input" value={edPayout} onChange={(e) => setEdPayout(e.target.value)}
-                placeholder={country.payoutPlaceholder} />
+                placeholder={payoutCountry.payoutPlaceholder} />
               <p className="tiny" style={{ color: "var(--muted)", margin: "8px 0 0" }}>
-                Currency ({country.code}) can't be changed after registration.
+                Currency ({registeredCode || payoutCountry.code}) can't be changed after registration.
               </p>
               {profileMsg && <p className={profileMsg.includes("✓") ? "success" : "error"} style={{ marginTop: 6 }}>{profileMsg}</p>}
               <div style={{ display: "flex", gap: 8, marginTop: 10 }}>

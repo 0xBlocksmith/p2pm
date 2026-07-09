@@ -36,6 +36,13 @@ type RelayIdentity = { address: `0x${string}`; publicKey: string; privateKey: `0
 /** Encrypt a plaintext payout handle to the merchant's own relay key → on-chain
  *  `bytes` (0x-hex). Throws only on a genuine crypto failure (caller handles). */
 export async function encryptPayout(plain: string, identity: RelayIdentity): Promise<Hex> {
+  // Guard the primitive itself: an empty/whitespace handle must never be
+  // encrypted-and-stored (it would decrypt back to "" and render as a confusing
+  // falsy "saved" state). All current callers pre-validate, but this keeps the
+  // shared primitive safe for any future caller.
+  if (!plain || !plain.trim()) {
+    throw new Error("Enter a payout ID before saving.");
+  }
   const { encryptPaymentAddress } = await import("@p2pdotme/sdk/orders");
   const res = await encryptPaymentAddress({
     paymentAddress: plain,

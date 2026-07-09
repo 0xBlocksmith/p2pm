@@ -14,8 +14,9 @@ import { loadCountry, prefsSet } from "../../lib/countries";
 /**
  * Registration only (country + language already chosen on /select). Shop name +
  * the country's payout field → registered ON-CHAIN via registerMerchant
- * (payoutId, shopName). The payout id is a generic string, so UPI / PIX / CBU
- * all fit today. Gas sponsored — no wallet popups.
+ * (encPayoutId, shopName). The payout handle is encrypted CLIENT-SIDE
+ * (encryptPayout) to the merchant's own relay key before it ever goes on-chain —
+ * the raw UPI / PIX / CBU is never public. Gas sponsored — no wallet popups.
  */
 export default function Onboarding() {
   const router = useRouter();
